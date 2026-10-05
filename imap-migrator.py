@@ -2,7 +2,7 @@
 r"""TLS-only IMAP migration. Python 3.10+, standard library; NSS for Thunderbird OAuth.
 
 Source mailboxes are EXAMINEd and bodies read with BODY.PEEK[]. Source mail is never deleted.
-Normal migration never deletes mail. Explicit --repair may remove only journaled
+Normal migration never deletes mail. The repair command may remove only journaled
 destination UIDs after a replacement passes verification. Source stays read-only.
 The SQLite journal contains hashes/UIDs/metadata, never passwords or mail bodies.
 Keep it across runs. Only one process may use a journal at a time.
@@ -83,6 +83,7 @@ OUTPUT_LOCK = threading.RLock()
 _progress_rows = 0
 _progress_columns = None
 LOG_FILE = None
+LOG_BACKLOG = None
 PROGRESS_ENABLED = False
 TSV_REPORT = None
 
@@ -118,6 +119,8 @@ def log(*args, sep=' ', end='\n', file=None, flush=True, file_only=False,
             text = file_text  # Plain mode shares the same text with the file log.
         if not file_only:
             builtins.print(text, end=end, file=stream, flush=flush)
+        if to_log and LOG_FILE is None and LOG_BACKLOG is not None:
+            LOG_BACKLOG.append(file_text+end)
         if to_log and LOG_FILE is not None:
             try:
                 builtins.print(file_text, end=end, file=LOG_FILE, flush=True)
@@ -289,7 +292,7 @@ def ini_path() -> Path:
     return CONFIG_PATH or Path(__file__).resolve().parent / INI_FILE
 
 
-def load_config(mode='migration'):
+def load_config(args):
     path = ini_path()
     parser = configparser.RawConfigParser(interpolation=None)
     try:
@@ -302,7 +305,8 @@ def load_config(mode='migration'):
 
     def endpoint(section: str) -> EndpointConfig:
         if not parser.has_section(section):
-            raise RuntimeError(f"{path}: missing [{section}] section")
+            available = ', '.join(name for name in parser.sections() if name.casefold() not in ('defaults', 'default'))
+            raise RuntimeError(f"{path}: account [{section}] not found; configured accounts: {available or '(none)'}")
 
         server = parser.get(section, "server", fallback="").strip()
         user = parser.get(section, "user", fallback="").strip()
@@ -342,14 +346,14 @@ def load_config(mode='migration'):
             thunderbird_primary_password=tb_primary,
         )
 
-    src = endpoint("source") if mode != "import" else None
-    dst = endpoint("destination") if mode != "export" else None
-
-    if mode != "export" and not parser.has_section("migration"):
-        raise RuntimeError(f"{path}: missing [migration] section")
-    root = parser.get("migration", "destination_root", fallback="").strip() if parser.has_section("migration") else ""
-    if mode != "export" and not root:
-        raise RuntimeError(f"{path}: [migration] destination_root is empty")
+    selected = [name for name in (args.source_account, args.destination_account) if name is not None]
+    if any(name.casefold() in ('defaults', 'default') for name in selected):
+        raise RuntimeError('[defaults] is reserved for operation defaults, not an account')
+    src = endpoint(args.source_account) if args.source_account is not None else None
+    dst = endpoint(args.destination_account) if args.destination_account is not None else None
+    root = args.root or ''
+    if not args.export_archive and not root.strip():
+        raise RuntimeError('--root must name a nonempty dedicated destination folder')
 
     try:
         mode = path.stat().st_mode & 0o777
@@ -361,7 +365,7 @@ def load_config(mode='migration'):
     except OSError:
         pass
 
-    return src, dst, root
+    return src, dst, root, parser
 
 
 def auth_description(ep: EndpointConfig) -> str:
@@ -1455,29 +1459,61 @@ class Journal:
 
 @dataclass
 class Options:
-    journal: Path
+    journal: Path | None
     batch_messages: int = 25
     batch_bytes: int = 16*1024*1024
     retries: int = 4
     full_verify: bool = False
+    state_dir: Path | None = None
 
 
-def options(args):
-    p = configparser.RawConfigParser()
-    p.read(ini_path(), encoding='utf-8')
-    if not p.has_section('migration'):
-        p.add_section('migration')
-    section = p['migration']
-    path = Path(section.get('journal', 'imap-migrator.sqlite3')).expanduser()
-    if not path.is_absolute():
-        path = ini_path().parent / path
-    opts = Options(path.resolve(), section.getint('batch_messages', 25),
-                   section.getint('batch_mib', 16)*1024*1024,
-                   section.getint('retries', 4),
-                   args.full_verify or section.getboolean('full_verify', False))
+def options(args, config):
+    section = config['defaults'] if config.has_section('defaults') else {}
+    def integer(key, default):
+        return int(section.get(key, default))
+    state_dir = Path(section.get('state_dir', 'imap-migrator-state')).expanduser()
+    if not state_dir.is_absolute():
+        state_dir = ini_path().parent / state_dir
+    opts = Options(args.journal.expanduser().resolve() if args.journal is not None else None,
+                   integer('batch_messages', 25), integer('batch_mib', 16)*1024*1024,
+                   integer('retries', 4), args.full_verify)
+    opts.state_dir = state_dir.resolve()
     if opts.batch_messages < 1 or opts.batch_messages > 500 or opts.batch_bytes < 1024*1024 or not 0 <= opts.retries <= 10:
-        raise RuntimeError('Invalid batch/retry settings')
+        raise RuntimeError('Invalid batch/retry settings in [defaults]')
     return opts
+
+
+def operation_identity(source, destination, root, archive_id=None):
+    identity = dict(version=2, source=[source.server.casefold(), source.user.casefold()],
+                    destination=[destination.server.casefold(), destination.user.casefold()], root=root)
+    if archive_id is not None:
+        identity['archive_id'] = archive_id
+    return identity
+
+
+def select_journal(opts, identity):
+    if opts.journal is None:
+        digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode('utf-8')).hexdigest()[:24]
+        kind = 'import' if 'archive_id' in identity else 'migration'
+        opts.journal = opts.state_dir / f'{kind}-{digest}.sqlite3'
+    opts.journal.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+
+def open_status_log(path, protected, archive_root=None):
+    if path is None:
+        return
+    global LOG_FILE, LOG_BACKLOG
+    path = path.expanduser().resolve()
+    if path in protected or (archive_root is not None and path.is_relative_to(archive_root)):
+        raise RuntimeError('Log must differ from configuration, script, journal, report and archive files')
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    LOG_FILE = os.fdopen(descriptor, 'a', encoding='utf-8')
+    log('\nRun started at '+_dt.datetime.now(_dt.timezone.utc).isoformat(), log_text='\n=== New run ===')
+    if LOG_FILE is not None and LOG_BACKLOG is not None:
+        LOG_FILE.writelines(LOG_BACKLOG)
+        LOG_FILE.flush()
+    LOG_BACKLOG = None
+    log(f'Log file: {str(path)!r}')
 
 
 def inventory(s, journal, side, folder, opts, full=False):
@@ -2043,7 +2079,7 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
         if remaining:
             raise RuntimeError(f'{df!r}: {remaining} destination message(s) cannot be matched to source '
                 'by content/multiplicity. No messages appended to this folder. '
-                'Use a new destination_root for a clean migration, or review existing mail manually.')
+                'Use a new --root for a clean migration, or review existing mail manually.')
         for su,du in adopted:
             j.bind(f.name, sv, su, df, dv, du)
             bound[su] = du
@@ -3122,7 +3158,7 @@ class ArchiveSource:
         self.archive = archive_json(header)
         validate_archive_header(root, self.archive)
         if self.archive.get('format') != ARCHIVE_VERSION or self.archive.get('complete') is not True:
-            raise RuntimeError('Archive is unsupported/incomplete; finish --export before --import')
+            raise RuntimeError('Archive is unsupported/incomplete; finish export before import, verify or repair')
         snapshot_path = archive_path(root, 'snapshot.metadata')
         payload = snapshot_path.read_bytes()
         if hashlib.sha256(payload).hexdigest() != self.archive.get('snapshot_sha256'):
@@ -3230,63 +3266,100 @@ class ArchiveSource:
 
 
 
-def main(argv=None):
-    global CONFIG_PATH, _stop_requested, RUN_STARTED, _progress_rows, LOG_FILE, PROGRESS_ENABLED, TSV_REPORT
-    RUN_STARTED = time.monotonic()
-    _progress_rows = 0
-    parser = argparse.ArgumentParser(description=__doc__,
-        epilog='Default: copy/resume from actual source, destination and journal state; no deletion.\n'
-               '--repair: copy/resume plus verified replacement/deletion; always full verification.\n'
-               '--verify-only: compare without uploading/deleting.\n'
-               '--retry-pending: explicit recovery of an ambiguous upload, not a completion/resume switch.',
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    archive_modes = parser.add_mutually_exclusive_group()
-    archive_modes.add_argument('--export', dest='export_archive', action='store_true',
-        help='Export/refresh a resumable EML and per-message metadata backup; source connection only')
-    archive_modes.add_argument('--import', dest='import_archive', action='store_true',
-        help='Upload the latest completed archive snapshot; destination connection only')
-    parser.add_argument('--path', type=Path, help='Archive directory, required with --export/--import')
-    parser.add_argument('--provider-notes', action='store_true', help='Show observed provider preservation behavior and exit')
-    parser.add_argument('--config', type=Path, help='INI path (default: beside script)')
-    parser.add_argument('--log-file', type=Path,
-        help='Append plain status/results to this UTF-8 file; --report-file receives message details when specified')
-    parser.add_argument('--report-file', type=Path, metavar='PATH',
-        help='Write a UTF-8 TSV difference/repair report (overwritten each run); required with --verify-only or --repair')
-    parser.add_argument('--progress', action='store_true',
-        help='Show elapsed timestamps, waiting indicators, live counts, transfer rates and copy time on the terminal (off by default)')
-    parser.add_argument('--skip-destination-tree-deploy', action='store_true',
-        help='Skip upfront folder creation, writable-selection checks and subscriptions; folders are still checked/created as reached during copying or repair')
-    parser.add_argument('--full-verify', action='store_true', help='Re-download both sides for independent content verification')
-    parser.add_argument('--retry-pending', action='store_true', help='Explicitly retry an unresolved upload only if no new destination UIDs exist; a delayed duplicate remains possible')
-    parser.add_argument('--resolve-pending-uid', type=int, metavar='UID', help='Explicitly identify a pending uploaded message after inspecting its candidate UID')
-    parser.add_argument('--repair', action='store_true', help='Copy/resume plus verified repair/deletion of damaged copies; implies --full-verify')
-    parser.add_argument('--verify-only', action='store_true', help='Verify without creating folders or uploading messages')
+def parse_command(argv):
+    parser = argparse.ArgumentParser(
+        description='Migrate, back up, restore and verify IMAP mail using named accounts.')
+    def common(command, subcommand=False):
+        def default(value):
+            return argparse.SUPPRESS if subcommand else value
+        command.add_argument('--config', type=Path, default=default(None),
+            help='Account INI path (default: imap-migrator.ini beside script)')
+        command.add_argument('--log', dest='log_file', type=Path, default=default(None),
+            help='Append plain status/results to a UTF-8 log; message details go to --report')
+        command.add_argument('--progress', action='store_true', default=default(False),
+            help='Show elapsed timestamps, waits, counters and transfer rates')
+    common(parser)
+    commands = parser.add_subparsers(dest='command', required=True)
+    for name, description in (
+            ('migrate', 'Copy/resume between named accounts; no destination deletion'),
+            ('export', 'Create or refresh a local EML archive from a named account'),
+            ('import', 'Restore a completed local archive to a named account'),
+            ('verify', 'Compare an account or archive with a destination; no upload/deletion'),
+            ('repair', 'Copy/resume and repair tracked destination copies after verifying replacements'),
+            ('providers', 'Show recorded provider observations; no configuration or connections')):
+        command = commands.add_parser(name, help=description, description=description)
+        common(command, subcommand=True)
+        command.set_defaults(source_account=None, destination_account=None, archive=None,
+            root=None, journal=None, report_file=None, full_verify=False,
+            retry_pending=False, resolve_pending_uid=None, skip_destination_tree_deploy=False)
+        if name == 'providers':
+            continue
+        if name == 'export':
+            command.add_argument('--from', dest='source_account', required=True, metavar='ACCOUNT')
+            command.add_argument('--to', dest='archive', type=Path, required=True, metavar='DIRECTORY')
+        elif name == 'import':
+            command.add_argument('--from', dest='archive', type=Path, required=True, metavar='DIRECTORY')
+        elif name in ('verify', 'repair'):
+            source = command.add_mutually_exclusive_group(required=True)
+            source.add_argument('--from', dest='source_account', metavar='ACCOUNT')
+            source.add_argument('--archive', type=Path, metavar='DIRECTORY')
+        else:
+            command.add_argument('--from', dest='source_account', required=True, metavar='ACCOUNT')
+        if name in ('migrate', 'export'):
+            command.add_argument('--full-verify', action='store_true',
+                help='Re-fetch existing bodies instead of using cached hashes; verify/import/repair always do this')
+        if name == 'export':
+            continue
+        command.add_argument('--to', dest='destination_account', required=True, metavar='ACCOUNT')
+        command.add_argument('--root', required=True, metavar='FOLDER',
+            help='Dedicated destination root (part of the journal identity)')
+        command.add_argument('--journal', type=Path, metavar='PATH',
+            help='Use an explicit existing/new SQLite journal instead of automatic selection')
+        command.add_argument('--report', dest='report_file', type=Path, metavar='PATH',
+            required=name in ('verify', 'repair'),
+            help='Write a UTF-8 TSV report; required for verify/repair; overwritten on rerun')
+        if name != 'verify':
+            command.add_argument('--skip-tree', dest='skip_destination_tree_deploy', action='store_true',
+                help='Skip upfront tree preparation/subscriptions; check folders as reached')
+            recovery = command.add_mutually_exclusive_group()
+            recovery.add_argument('--retry-pending', action='store_true',
+                help='Explicitly retry an uncertain upload only if no new destination UIDs exist')
+            recovery.add_argument('--resolve-pending-uid', type=int, metavar='UID',
+                help='Explicitly identify an uncertain uploaded destination UID after inspecting it')
     args = parser.parse_args(argv)
-    PROGRESS_ENABLED = args.progress
-    TSV_REPORT = None
-    if (args.verify_only or args.repair) and args.report_file is None:
-        parser.error('--report-file PATH is required with --verify-only and --repair')
-    if args.report_file is not None and (args.export_archive or args.provider_notes):
-        parser.error('--report-file cannot be combined with --export or --provider-notes')
-    if (args.export_archive or args.import_archive) != (args.path is not None):
-        parser.error('--path is required with --export/--import and cannot be used without them')
-    if args.export_archive and (args.repair or args.verify_only or args.retry_pending
-                               or args.resolve_pending_uid is not None or args.skip_destination_tree_deploy):
-        parser.error('--export cannot be combined with destination operation options')
-    if args.provider_notes and (args.export_archive or args.import_archive):
-        parser.error('--provider-notes cannot be combined with --export/--import')
-    if args.retry_pending and args.resolve_pending_uid is not None:
-        parser.error('--retry-pending and --resolve-pending-uid are mutually exclusive')
-    if args.verify_only and (args.retry_pending or args.resolve_pending_uid is not None):
-        parser.error('Pending recovery options cannot be combined with --verify-only')
     if args.resolve_pending_uid is not None and args.resolve_pending_uid < 1:
         parser.error('--resolve-pending-uid must be positive')
-    if args.repair and args.verify_only:
-        parser.error('--repair and --verify-only are mutually exclusive')
-    if args.provider_notes:
-        show_provider_notes()
-        return 0
+    args.export_archive = args.command == 'export'
+    args.import_archive = args.command == 'import' or (args.command in ('verify', 'repair') and args.archive is not None)
+    args.path = args.archive
+    args.repair = args.command == 'repair'
+    args.verify_only = args.command == 'verify'
+    args.full_verify = args.full_verify or args.repair or args.verify_only or args.import_archive
+    return args
+
+
+def main(argv=None):
+    global CONFIG_PATH, _stop_requested, RUN_STARTED, _progress_rows, LOG_FILE, LOG_BACKLOG, PROGRESS_ENABLED, TSV_REPORT
+    RUN_STARTED = time.monotonic()
+    _progress_rows = 0
+    args = parse_command(argv)
+    PROGRESS_ENABLED = args.progress
+    LOG_BACKLOG = [] if args.log_file is not None else None
+    TSV_REPORT = None
     CONFIG_PATH = args.config.expanduser().resolve() if args.config else None
+    if args.command == 'providers':
+        try:
+            open_status_log(args.log_file, {Path(__file__).resolve(), ini_path().resolve()})
+            show_provider_notes()
+            return 0
+        except (RuntimeError, OSError) as exc:
+            log(f'ERROR: {exc}', file=sys.stderr)
+            return 1
+        finally:
+            LOG_BACKLOG = None
+            if LOG_FILE is not None:
+                LOG_FILE.close()
+                LOG_FILE = None
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
     src = dst = journal = archive_lock = None
@@ -3294,24 +3367,16 @@ def main(argv=None):
     # Applies to the SQLite journal and sidecars, without changing existing INI permissions.
     previous_umask = os.umask(0o077)
     try:
-        source_cfg, dest_cfg, root = load_config('export' if args.export_archive else
-                                                  'import' if args.import_archive else 'migration')
-        opts = options(args)
-        if args.log_file:
-            log_path = args.log_file.expanduser().absolute()
-            if log_path.resolve() in (ini_path().resolve(), opts.journal.resolve()):
-                raise RuntimeError('Log file must differ from configuration and journal')
-            descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            LOG_FILE = os.fdopen(descriptor, 'a', encoding='utf-8')
-            log('\nRun started at '+_dt.datetime.now(_dt.timezone.utc).isoformat(),
-                log_text='\n=== New run ===')
-            log(f'Log file: {str(log_path)!r}; includes message Subjects and Dates.')
+        source_cfg, dest_cfg, root, config = load_config(args)
+        opts = options(args, config)
+        archive_id = None
         if args.export_archive or args.import_archive:
             archive_root = args.path.expanduser().resolve()
             if args.import_archive and not archive_root.is_dir():
                 raise RuntimeError(f'Archive directory does not exist: {archive_root}')
             archive_lock = ArchiveLock(archive_root)
             if args.export_archive:
+                open_status_log(args.log_file, {ini_path().resolve(), Path(__file__).resolve()}, archive_root)
                 log(f'Configuration: {ini_path()}')
                 src = ExportSession(source_cfg, 'source', opts.retries)
                 return export_archive(src, archive_root, opts)
@@ -3321,33 +3386,31 @@ def main(argv=None):
             archive_id = src.archive['archive_id']
             if not isinstance(archive_id, str) or not re.fullmatch(r'[0-9a-f]{32}', archive_id):
                 raise RuntimeError('Invalid archive identifier')
-            opts.journal = opts.journal.with_name(opts.journal.stem+'-import-'+archive_id[:12]+opts.journal.suffix)
             log('Import uses the completed local snapshot; full byte verification is enabled.')
+        identity = operation_identity(source_cfg, dest_cfg, root, archive_id)
+        select_journal(opts, identity)
+        protected = {ini_path().resolve(), opts.journal.resolve(), Path(__file__).resolve()}
+        protected.update(Path(str(opts.journal)+suffix) for suffix in ('-wal', '-shm', '-journal', '.lock'))
+        if opts.journal.resolve() in (ini_path().resolve(), Path(__file__).resolve()) or (
+                args.import_archive and opts.journal.resolve().is_relative_to(archive_root)):
+            raise RuntimeError('Journal must differ from configuration, script and archive files')
+        log_protected = set(protected)
+        if args.log_file is not None:
+            protected.add(args.log_file.expanduser().resolve())
         if args.report_file is not None:
             report_path = args.report_file.expanduser().resolve()
-            protected = {ini_path().resolve(), options(args).journal.resolve(),
-                         opts.journal.resolve(), Path(__file__).resolve()}
-            protected.update(Path(str(path)+suffix) for path in tuple(protected)
-                             for suffix in ('-wal', '-shm', '-journal', '.lock'))
-            if args.log_file:
-                protected.add(args.log_file.expanduser().resolve())
-            if report_path in protected or (args.import_archive and
-                    report_path.is_relative_to(archive_root)):
-                raise RuntimeError('Report must differ from configuration, script, journals, log and archive files')
-        if args.repair:
-            opts.full_verify = True
+            if report_path in protected or (args.import_archive and report_path.is_relative_to(archive_root)):
+                raise RuntimeError('Report must differ from configuration, script, journal, log and archive files')
+            log_protected.add(report_path)
+        open_status_log(args.log_file, log_protected, archive_root if args.import_archive else None)
         mode = ('verify only; no upload/deletion' if args.verify_only else
                 'copy/resume and verified repair; full verification; selective deletion enabled'
                 if args.repair else 'copy/resume; restore missing mail; no destination deletion')
         log('Mode: ' + mode)
-        if args.repair and args.full_verify:
-            log('Note: --repair already implies --full-verify.')
         show_provider_notes(dest_cfg.server)
         if not args.import_archive and (source_cfg.server.casefold(), source_cfg.user.casefold()) == (dest_cfg.server.casefold(), dest_cfg.user.casefold()):
             raise RuntimeError('Source and destination must be different accounts')
-        journal = Journal(opts.journal, dict(version=2, source=[source_cfg.server.casefold(), source_cfg.user.casefold()],
-            destination=[dest_cfg.server.casefold(),dest_cfg.user.casefold()], root=root,
-            **({'archive_id': src.archive['archive_id']} if args.import_archive else {})))
+        journal = Journal(opts.journal, identity)
         if args.report_file is not None:
             TSV_REPORT = VerificationReport(report_path)
             log(f'TSV report: {report_path}; message-level findings are written here.')
@@ -3373,7 +3436,7 @@ def main(argv=None):
         if not args.verify_only:
             check_provider_layout(dest_cfg.server, names, delim)
             if args.skip_destination_tree_deploy:
-                log('Skipping destination tree preparation/subscriptions (--skip-destination-tree-deploy). '
+                log('Skipping destination tree preparation/subscriptions (--skip-tree). '
                     'Folders will be checked/created as reached during copying or repair.')
             else:
                 prepare_destination_tree(dst, names, delim,
@@ -3384,8 +3447,8 @@ def main(argv=None):
             tasks = journal.repair_rows()
             if tasks and not args.repair:
                 raise RuntimeError('A previous repair has outstanding candidates/cleanup. '
-                    'Default copy/resume will not finish a deletion: rerun with --repair '
-                    '(full verification is implied), or inspect with --verify-only --full-verify.')
+                    'Copy/resume will not finish a deletion: use the repair command '
+                    'with --report, or inspect with verify --report.')
             if any(task['sf'] not in names or task['df'] != names[task['sf']] for task in tasks):
                 raise RuntimeError('Outstanding repair falls outside current migration folder mappings')
             log('Counting source messages...', flush=True, progress_only=True)
@@ -3445,7 +3508,7 @@ def main(argv=None):
         if TSV_REPORT is not None:
             with contextlib.suppress(OSError):
                 TSV_REPORT.write(phase='run', status='interrupted', details='Partial report; run did not finish.')
-        message = ('Stopped. Archive files are retained; rerun --export with the same --path to resume.'
+        message = ('Stopped. Archive files are retained; rerun export with the same --to directory to resume.'
                    if args.export_archive else 'Stopped. Keep the journal and rerun to resume safely.')
         log('\n'+message, file=sys.stderr)
         return 130
@@ -3454,11 +3517,12 @@ def main(argv=None):
             with contextlib.suppress(OSError):
                 TSV_REPORT.write(phase='run', status='error', details=str(exc))
         advice = ('Source messages were not deleted. Archive files are retained; interrupted exports '
-                  'can resume with --export and the same --path.' if args.export_archive else
+                  'can resume with export and the same --to directory.' if args.export_archive else
                   'Source messages were not deleted. Keep the journal when resuming.')
         log(f'\nERROR: {exc}\n{advice}', file=sys.stderr)
         return 1
     finally:
+        LOG_BACKLOG = None
         for item in (src,dst,journal,archive_lock):
             if item:
                 item.close()

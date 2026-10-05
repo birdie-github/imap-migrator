@@ -1,71 +1,50 @@
-# IMAP migration configuration
+# Named IMAP accounts. Section names are aliases used by --from / --to.
+# An email address can also be a section name, e.g. [account@gmail.com].
+# Roles are chosen by each command; no account is permanently source/destination.
+# Copy this file to imap-migrator.ini and replace the example credentials.
+# Keep credentials private: chmod 600 imap-migrator.ini
+# Connections use implicit TLS on TCP port 993.
 #
-# Each endpoint must use EXACTLY ONE authentication method:
-#
-# METHOD 1: normal IMAP password
-#
-#   password=your-password
-#   token=
-#   thunderbird_profile=
-#
-# METHOD 2: direct OAuth2 ACCESS TOKEN (XOAUTH2)
-#
-#   password=
-#   token=your-OAuth2-ACCESS-token
-#   thunderbird_profile=
-#
-# token= must be an ACCESS TOKEN accepted directly by the IMAP server. It is
-# not a refresh token, authorization code, client secret, or dashboard entry.
-#
-# METHOD 3: reuse Microsoft OAuth already stored by Thunderbird
-#
-#   password=
-#   token=
-#   thunderbird_profile=~/.thunderbird/xxxxxxxx.yyy
-#   thunderbird_primary_password=
-#
-# Thunderbird mode currently supports Microsoft/Outlook IMAP only. The script
-# reads Thunderbird's encrypted OAuth refresh token from logins.json, decrypts
-# it through key4.db using libnss3, asks Microsoft for a fresh IMAP access
-# token, and then authenticates to IMAP using XOAUTH2.
-#
-# The Thunderbird profile is NOT modified and no OAuth token is copied into
-# this INI file.
-#
-# If Thunderbird uses a Primary Password, set it in
-# thunderbird_primary_password=. Otherwise leave that line empty.
-#
-# Connections are always implicit TLS/SSL on TCP port 993.
-# Relative profile paths are resolved relative to this INI; '~' is expanded.
-# Keep this file private if it contains passwords:
-#
-#   chmod 600 imap-migrate.ini
+# Each selected account must set EXACTLY ONE of:
+#   password=              IMAP password or provider app password
+#   token=                 current IMAP OAuth ACCESS token, not a refresh token
+#   thunderbird_profile=   existing Thunderbird OAuth profile (Google/Microsoft)
+# Thunderbird must already have this exact account configured with OAuth2.
+# Profiles are read without modification; NSS/libnss3 is required.
+# Relative profile paths are resolved beside this INI; ~ is expanded.
+# If the profile has a Primary Password, set thunderbird_primary_password=.
 
+[gmail]
+server = imap.gmail.com
+user = account@gmail.com
+thunderbird_profile = ~/.thunderbird/xxxxxxxx.default-release
+thunderbird_primary_password =
 
-[source]
-server=imap.source.com
-user=mememe@source.com
+[hotmail]
+server = outlook.office365.com
+user = account@hotmail.com
+thunderbird_profile = ~/.thunderbird/xxxxxxxx.default-release
+thunderbird_primary_password =
 
-# Choose exactly one:
-password=SOURCE-IMAP-PASSWORD
-token=
-thunderbird_profile=
-thunderbird_primary_password=
+[gmx]
+server = imap.gmx.com
+user = account@gmx.com
+password = REPLACE-WITH-IMAP-PASSWORD
 
+[defaults]
+# Automatically selected journals live here. Relative to this INI, not the cwd.
+# Account identities, destination root and archive identity select separate files.
+# Keep this directory when resuming. Override one run with --journal PATH.
+state_dir = imap-migrator-state
 
-[destination]
-server=imap.destination.com
-user=blahblah@destination.com
+# Batch size limits. A single oversized message is transferred alone.
+batch_messages = 25
+batch_mib = 16
+retries = 4
 
-# Recommended here: reuse the Thunderbird profile in which this Outlook
-# account already works with Authentication method = OAuth2.
-password=
-token=
-thunderbird_profile=~/.thunderbird/xxxxxxxx.default-release
-thunderbird_primary_password=
-
-
-[migration]
-# All source folders are recreated below this dedicated destination folder.
-# Example: source INBOX -> TheSource/INBOX
-destination_root=TheSource
+# Destinations, roots, archive paths, reports and progress are command-line choices.
+# Examples:
+#   python3 imap-migrator.py migrate --from gmx --to gmail --root GMX
+#   python3 imap-migrator.py export  --from gmx --to ./gmx-backup
+#   python3 imap-migrator.py import  --from ./gmx-backup    --to hotmail --root GMX
+#   python3 imap-migrator.py verify  --archive ./gmx-backup --to hotmail --root GMX --report verify.tsv

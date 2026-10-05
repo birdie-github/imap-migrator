@@ -28,15 +28,15 @@ Provider rules still apply: folder nesting, quotas, supported flags, and message
 
 ### How do I copy all my email to another account?
 
-Configure the source and destination IMAP accounts and choose a dedicated destination root, then run `python3 imap-migrator.py`. Keep the journal to resume. Use `--verify-only --full-verify` for an independent comparison after copying. The commands and configuration details follow below.
+Define named accounts in one INI, then run `python3 imap-migrator.py migrate --from yandex --to hotmail --root Yandex`. Keep the journal to resume. The `verify` command independently compares both sides and writes a TSV report. Commands and configuration details follow below.
 
 ### Can I download my Gmail or Outlook mailbox as EML files?
 
-Yes, when the account permits IMAP access. Use `--export --path /path/to/archive` to create a local email backup. Each message has its own EML file and companion metadata; filenames use UIDs rather than potentially unsafe subject text. Export does not require a destination account.
+Yes, when the account permits IMAP access. Use `export --from gmail --to /path/to/archive` to create a local email backup. Each message has its own EML file and companion metadata; filenames use UIDs rather than potentially unsafe subject text. Export does not require a destination account.
 
 ### Can I import an email backup into a different provider?
 
-Use `--import --path /path/to/archive` with an archive produced by this script. Import restores the latest completed snapshot, verifies local message hashes before connecting, and performs full destination verification. Arbitrary EML collections without the archive metadata are not supported.
+Use `import --from /path/to/archive --to hotmail --root Backup` with an archive produced by this script. Import restores the latest completed snapshot, verifies local message hashes before connecting, and performs full destination verification. Arbitrary EML collections without the archive metadata are not supported.
 
 ### Will my emails, attachments, dates, and read/unread status be preserved?
 
@@ -44,217 +44,158 @@ Export preserves the fetched message bytes, including attachments. Migration and
 
 ### Is this a mailbox sync tool or a one-way migration tool?
 
-It is a one-way email migration, backup, and restore tool. It does not mirror source deletions or provide continuous two-way synchronization. An ordinary rerun resumes copying and restores missing tracked messages; `--repair` additionally checks and repairs tracked damaged destination copies.
+It is a one-way email migration, backup, and restore tool. It does not mirror source deletions or provide continuous two-way synchronization. An ordinary rerun resumes copying and restores missing tracked messages; the `repair` command additionally checks and repairs tracked damaged destination copies.
 
-## Requirements
+## Requirements and setup
 
-A TLS-only, standard-library Python IMAP migration script. Python 3.10 or newer is required. Thunderbird Microsoft/Google OAuth additionally requires the system NSS library (`libnss3`). Normal migration never deletes mail from either endpoint. Explicit `--repair` can delete specific journaled destination UIDs after verifying replacements; the source is always read-only. The source is opened read-only, and bodies are fetched with `BODY.PEEK[]`.
-
-## Run
-
-Keep `imap-migrator.py` and your existing `imap-migrator.ini` together:
+Python **3.10 or newer**, compatible IMAP access, and implicit TLS on port 993. The script uses Python's standard library. Thunderbird OAuth additionally requires the system NSS library (`libnss3`). No pip packages are needed.
 
 ```bash
+cp imap-migrator.ini.sample imap-migrator.ini
 chmod 600 imap-migrator.ini
-python3 imap-migrator.py
 ```
 
-The previous configuration remains compatible. Additional settings in the revised sample are optional. Copy authentication details into your existing INI; do not replace them with the sample placeholders. Thunderbird profiles are read without modification.
+Edit the account sections with your own server, username and authentication settings. Account names are arbitrary, case-sensitive aliases; `[gmail]`, `[work]` or `[account@gmail.com]` all work. Configure as many accounts as needed and choose their roles per command. Only the selected accounts' connection settings are required.
 
-To independently re-download and verify both sides:
+Choose exactly one authentication method per account:
 
-```bash
-python3 imap-migrator.py --verify-only --full-verify
-```
-
-Other options:
-
-```bash
-python3 imap-migrator.py --config /path/to/imap-migrator.ini
-python3 imap-migrator.py --full-verify
-python3 imap-migrator.py --help
-```
-
-Exit codes: `0` byte-identical and verified, `1` operation stopped/failed, `2` verification failed, `130` interrupted.
-
-## Existing migration attempts
-
-The dedicated destination root must contain only this migration. Before uploading into a populated folder, the script compares existing destination content against the source, including the number of occurrences of identical messages. It stops that folder before uploading if destination messages cannot be matched. It does not infer identity from Message-ID alone, silently ignore changed content, or delete excess messages.
-
-Your reported `Arc` counts (249 source versus at least 292 destination) will trigger this check if those counts remain unchanged. To perform a clean migration without touching earlier attempts, choose both a new root and a new journal:
-
-```ini
-[migration]
-destination_root=Yandex-new
-journal=imap-migrator-new.sqlite3
-```
-
-Do not delete the earlier root until the new migration has passed `--verify-only --full-verify` and you have reviewed it. Changing accounts or roots while keeping the same journal is rejected deliberately.
-
-## Resume and interruption
-
-Keep the SQLite journal (`imap-migrator.sqlite3` by default) across runs. It contains folder names, UIDs, hashes, dates, flags, and source-to-destination bindings, but no credentials or message bodies. A process lock prevents two runs from using the same journal simultaneously. The journal is created with private Unix permissions.
-
-Read operations reconnect and retry with bounded backoff. Uploads use durable write-ahead records: the pending record is committed before sending APPEND. An accepted APPENDUID is saved before the pending record is cleared. If the server accepts an upload but its reply is lost, recovery examines new destination UIDs and requires one unique matching message. If recovery cannot establish the outcome, the script stops and retains the pending record. An unaccepted upload and an accepted upload whose content was rewritten can be indistinguishable after a disconnect; safely resolving every such case automatically is impossible without additional server guarantees.
-
-An explicit tagged APPEND rejection clears the pending record and stops with the server error. Interrupted reads can be retried; an uncertain APPEND is never blindly retried. Do not remove the journal to bypass an unresolved upload: that discards the evidence needed to prevent duplicates. Inspect the destination and pending record before making any manual repair.
-
-Destination UID assignments are retained even when later content verification finds differences. Accepted messages whose returned content differs produce warnings, and copying continues through all folders. Rerunning reports the differences without appending the same journaled source message again. Exact verification still returns exit code 2 when content differs; it does not silently certify altered messages. If a mapped destination UID disappears, an ordinary rerun now restores that source message without deleting any destination mail (patch 007). Accepted copies that still exist but differ require explicit repair for replacement.
-
-## Performance and memory
-
-A source worker downloads ahead while the destination uploads. Each connection has a single owner. The queue is bounded, and the source worker sends keepalive NOOPs while waiting for uploads. The consumer can reconnect safely if the source closes during the final batch.
-
-Both message count and estimated byte size limit batches. Defaults are 25 messages and 16 MiB. A single larger message is transferred alone; this is not an absolute per-message memory limit. Several batches can coexist briefly in memory, and parsing/hashing makes temporary byte copies. Complete folder bodies are not retained. Metadata and hashes use memory proportional to message count.
-
-Uploads remain serial on one destination connection; downloaded bodies overlap those uploads. Accepted destination bodies are read back in batches, avoiding a verification request per message when APPENDUID is available. The script does not implement MULTIAPPEND or multiple concurrent upload sessions. Provider latency, throttling, and upload limits still apply; there is no promised speedup multiplier.
-
-First-time adoption of an existing populated folder requires downloading both sides to establish content identity. Normal resumes download only bodies missing from the journal, plus new messages being transferred. Metadata is refreshed each run. Without APPENDUID, each successful upload requires additional reconciliation, so that fallback is slower.
-
-## Verification
-
-Every accepted upload is read back and checked, in batches. By default the final pass checks current UID inventories, flags, dates, sizes, and cached content hashes. This is explicitly reported as cached verification, not an independent fresh body comparison. UIDVALIDITY identifies the lifetime of UID assignments; a changed validity triggers reindexing, and a change during reconnect stops the operation.
-
-Use `--full-verify` for independent body downloads from both endpoints. Exact preservation compares original bytes. A separate conservative fingerprint classifies recognized formatting and transfer representation changes as “equivalent under checked rules.” Text payload line-ending differences can qualify for checked equivalence; binary payload bytes must match. Equivalence does not produce an exact-preservation success: byte differences still return exit code 2. Flags and INTERNALDATE are checked independently. Unparseable dates are errors, never silently treated as matching. Content rewritten by the destination is reported as a verification difference even if the server accepted the upload. With complete journal bindings, verification distinguishes accepted-but-changed messages from missing messages and compares flags/dates separately from content hashes. Copying continues despite these differences. For the first changed message in a folder, a diagnostic lists added, removed, and changed header field names and compares decoded MIME payloads/structure. It prints no header values or message bodies. This diagnostic does not relax verification or authorize adoption of preexisting messages.
-
-Only `\Seen`, `\Answered`, `\Flagged`, and `\Draft` are transferred. `\Deleted`, server-owned `\Recent`, and custom keywords are excluded. Mailboxes may not support every portable flag; any resulting flag difference is reported.
-
-Keep both accounts stable during migration and verification. Concurrent folder/message/flag changes can cause a stop or failed verification. Checks detect changes during individual folder scans, but IMAP does not provide an atomic snapshot of an entire account. Leave the dedicated destination root untouched until the migration is complete.
-
-Source hierarchy components that contain the destination delimiter are rejected before copying because they cannot be mapped losslessly. Ambiguous destination namespaces and case-insensitive mapping collisions are rejected too.
-
-## Offline regression tests
-
-```bash
-python3 -m unittest -v test_imap_migrator.py
-```
-
-The tests use a real `imaplib` client against an in-process local IMAP test server, with synthetic mail only. They cover normal transfer/resume, literal-tail metadata, case-insensitive flags, read reconnects, lost APPEND replies, missing APPENDUID, duplicate multiplicity, destination rewriting, pending recovery, changed UIDVALIDITY, quota rejection, disappeared destination mail, journal locking/identity, folder mapping, dates, and byte-limited batches. They do not exercise live Yandex/Outlook, TLS handshakes, or Thunderbird OAuth.
-
-
-## Provider notices and checked equivalence (patch 004)
-
-Before either connection opens, the script warns about recorded behavior for the selected destination host. Untested hosts are labeled UNKNOWN. Use `--provider-notes` to show the built-in table without configuration or a connection. See `IMAP-PROVIDER-NOTES.md` for the current evidence and how to add another tested provider.
-
-Message comparisons report BYTE IDENTICAL, EQUIVALENT UNDER CHECKED RULES; ORIGINAL BYTES CHANGED, or CHANGED OR UNCERTAIN / INCOMPLETE. Provider entries never bypass checks. Changes to recipients, display names, unknown headers, body/attachment payloads, filenames, or MIME structure are not automatically accepted as harmless. Signed messages and malformed/unsupported MIME remain unclassified when bytes differ. Unknown header values and repeated field order are preserved. The checker does not authenticate mail or validate signatures.
-
-The journal stays compatible. On the first run after patch 004, cached bodies without the new versioned equivalence fingerprint are downloaded once and rehashed. Source-to-destination UID bindings are preserved, so accepted messages are not uploaded again. Subsequent runs reuse the enriched cache. For an independent comparison, use `--verify-only --full-verify`.
-
-The semantic fingerprint is used for reporting and, from patch 006, uniquely checked-equivalent pending-upload reconciliation. Legacy destination adoption still uses the existing exact-content/multiplicity rule.
-
-
-## Repair missing or damaged destination messages (patch 005)
-
-After the current copying process has stopped, apply patch 005 after patches 001–004, keep the existing journal, and run:
-
-```bash
-python3 imap-migrator.py --repair --full-verify
-```
-
-`--repair` forces full body downloads even without `--full-verify`. It is mutually exclusive with `--verify-only`. It first resumes any pending uploads and repair cleanup, then checks the source and destination folders and copies missing messages. For journaled messages with content/metadata differences, it appends a replacement, reads the replacement back, and requires exact bytes or checked equivalence **plus matching portable flags and INTERNALDATE** before committing the replacement mapping. Recognized equivalent formatting alone never triggers replacement.
-
-Only after the replacement passes verification does repair mark the specific old destination UID as Deleted and issue `UID EXPUNGE` for that UID. It never issues ordinary EXPUNGE or CLOSE. If an existing message must be replaced and the server cannot selectively expunge a UID, repair refuses before appending its replacement. Restoring a missing message needs no deletion capability.
-
-The journal records candidate UIDs, original source/old-copy hashes, and pending cleanup. An interruption can resume the same candidate or cleanup without appending another replacement. If the replacement fails verification, the old copy and candidate are retained, the original mapping remains, and the final check reports differences. A subsequent repair pass rechecks that same candidate rather than creating repeated duplicates. A failed candidate that still fails needs inspection; it is not automatically discarded or replaced with endless new candidates.
-
-Repair leaves untracked mail alone. Existing untracked messages may be adopted only under the original exact-content/multiplicity rule; unidentified extras cause a stop. It does not propagate source deletions, delete obsolete folders, or clean unrelated duplicates. Source/destination UIDVALIDITY changes, source-content changes during an outstanding repair, or changes to the old target cause a stop before deleting it.
-
-A final independent full verification follows repairs. Exit code 2 can still mean all mail is present but a provider reformatted it into checked-equivalent messages. Outstanding failed candidates and incomplete cleanup also prevent success. Keep the source originals and journal until you have reviewed the final results.
-
-Use the same command to resume an interrupted repair. An ordinary migration refuses to proceed while repair candidates/cleanup remain; `--verify-only --full-verify` can inspect them without modifying messages.
-
-
-## Recover an unresolved APPEND (patch 006)
-
-Pending recovery now reports the destination UIDVALIDITY, last UID before the upload, new UID count, exact matches, checked-equivalent matches, and acknowledged APPENDUID when available. If no exact match exists but precisely one new candidate passes conservative checked equivalence against the original journaled source fingerprint, the pending upload is recovered automatically. This does not mark it byte-identical; full verification still reports original-byte differences.
-
-If recovery reports no new destination UIDs, you can explicitly allow one retry:
-
-```bash
-python3 imap-migrator.py --repair --full-verify --retry-pending
-```
-
-The script reconnects to the destination, checks UIDVALIDITY and inventories again, validates the original source UID/content, and updates the durable pending record in place before uploading. It refuses if new destination UIDs exist, and never retries automatically after a second lost reply. A delayed original server-side commit remains possible: this option explicitly accepts a residual duplicate risk. Keep the journal/source and inspect the final full verification.
-
-If candidate UIDs exist but neither exact nor checked equivalence identifies the message, inspect the raw source and destination candidate messages. Only after identifying the correct uploaded message, use:
-
-```bash
-python3 imap-migrator.py --repair --full-verify --resolve-pending-uid 123
-```
-
-Replace 123 with the actual destination UID, not the source UID or a sequence number. This explicitly asserts upload identity; it does not certify content. The UID must exist, be new or acknowledged for the pending upload, and not belong to another mapped message/repair. Repair still verifies a replacement before deleting an old copy. The retry and explicit-UID options are mutually exclusive and cannot be used with `--verify-only`.
-
-Patch 006 was produced without running tests at the user's request.
-
-
-## Copy/resume versus repair (patch 007)
-
-The script does not rely on the user deciding that migration is finished. Each run derives remaining work from source/destination inventories and the journal. Repair is also valid for an unfinished migration.
-
-| Command | Operation |
+| Setting | Meaning |
 |---|---|
-| No flags | Copy/resume, including restoring absent journaled messages; no destination deletion |
-| `--repair` | Copy/resume plus verified replacement/deletion; full verification is implied |
-| `--verify-only --full-verify` | Independent comparison; no upload/deletion |
-| Add `--retry-pending` when recovery reports zero new UIDs | Explicitly allow one ambiguous-upload retry with residual duplicate risk; not a general resume requirement |
+| `password` | IMAP password or provider-specific app password |
+| `token` | Current OAuth **access token** accepted by IMAP; not a refresh token |
+| `thunderbird_profile` | Reuse an existing Thunderbird Google/Microsoft OAuth credential |
 
-`--repair --full-verify` is accepted for compatibility but prints that full verification is already implied. `--repair --retry-pending` is sufficient when both operations are intended. An unresolved outcome is not treated as a confirmed missing message: ordinary missing-message restoration does not silently retry an ambiguous APPEND. If an older repair has unfinished candidate/cleanup records, default copying stops with directions to use `--repair`; it does not silently gain permission to delete mail.
+For Thunderbird OAuth, `user` must match the saved account address. Thunderbird must already use OAuth2 for it. Set `thunderbird_primary_password` only if its profile requires one. The profile is read without modification; refresh tokens and credentials are not saved in archives or journals. Reauthorize in Thunderbird if a refresh token is revoked.
 
-The startup mode line describes the selected behavior. Known destination folder-depth limits are checked for the entire mapping before copying or deleting mail, rather than discovering the limit halfway through the migration. GMX's recorded limit is three total levels, counting the destination root. See `IMAP-PROVIDER-NOTES.md`. Deeper mappings need a compatible destination or a deliberate remapping plan; this patch does not silently change existing folder names.
+The optional `[defaults]` section sets `state_dir`, `batch_messages`, `batch_mib` and `retries`. Relative `state_dir` and Thunderbird profile paths are resolved beside the INI. Command-line paths are relative to the current directory. `--config PATH` selects a different INI.
 
-Patch 007 and the updated regression expectations were not tested, at the user's request.
+## Commands
 
-Gmail OAuth: set `server=imap.gmail.com`, `user=` to the exact account address saved in Thunderbird, and `thunderbird_profile=` to its profile directory. Thunderbird must already access that account using OAuth2. The script selects the saved Google credential with the `https://mail.google.com/` scope and refreshes it using Thunderbird’s public installed-app client details. Calendar/contacts-only tokens are excluded. No profile changes or token persistence are performed. If Google revokes the refresh token, reauthorize the account in Thunderbird and rerun. Use a separate journal when changing destination accounts/providers.
-
-Before normal copying, repair, or pending-upload recovery, the script prepares the entire mapped destination tree: it creates missing parent folders first and checks writable selection of every message folder. Preparation failure aborts before message uploads/deletions; successfully created folders remain for resuming. It then subscribes folders, including parent containers, for mail-client visibility; subscription failures warn and do not prevent copying. Existing folders are reused. `--verify-only` creates/subscribes nothing. Writable selection cannot guarantee APPEND permissions, available quota, or acceptance of every message; copying and verification still check those operations.
-
-Status output uses monotonic elapsed timestamps `[HH:MM:SS.hh]` since startup, with hundredths of a second and no initial zero-time banner. Connections, source/destination enumeration, counting, copying, hashing, recovery, repair, and verification notices are timestamped. Normal copying displays separate folder/overall processed, remaining, copied-this-run, and already-mapped counters; processed counts are not verification results. The folder summary also reports destination occupancy at the time of its scan. Copy speed counts uploads rather than already-mapped messages; elapsed copy time uses hours/minutes/seconds. Progress counters have no timestamp prefixes; the speed line retains one elapsed-copy-time field. Operation messages remain timestamped. Terminals redraw the progress block; redirected output records periodic snapshots. Repair retains its operation-specific results rather than using normal-copy counters.
-
-Destination preparation logs each folder, CREATE, writable SELECT, return to EXAMINE, and subscription before sending the operation; per-folder and total preparation durations are shown. It reuses the destination listing already obtained for mapping and sends source NOOP keepalives between preparation operations when the source has been idle for over 30 seconds. A single blocking network operation can still exceed that interval; normal read reconnect handling remains in place. OAuth token-refresh completion and IMAP-authentication completion are logged separately to distinguish authentication latency from folder preparation.
-
-When both source and destination folders are empty, normal copying emits one timestamped “Nothing to copy” line instead of a progress block. Overall counters remain unchanged. Nonempty destination folders are explicitly reported and still undergo reconciliation; final source-change checks, folder preparation, and verification remain in place for empty folders.
-
-Use `./imap-migrator.py --skip-destination-tree-deploy` to resume without repeating the upfront destination-tree creation, writable-selection checks, and subscriptions. It also works with `--repair`. Mapping/collision checks, known provider-depth checks, source counting, journal recovery, and content verification still run. Each folder is checked/created as reached during copying or repair, so a missing/new folder can still be restored; later folder errors may therefore occur after earlier folders have copied. The option does not change the journal or assume that messages are complete, and it has no effect with `--verify-only`.
-
-
-## Offline migration and incremental EML backup
+### Copy directly between accounts
 
 ```bash
-./imap-migrator.py --export --path /path/to/archive
-# Change connection/network, then:
-./imap-migrator.py --import --path /path/to/archive
+python3 imap-migrator.py migrate --from yandex --to hotmail --root Yandex
 ```
 
-Export connects only to the source; import connects only to the destination. Export needs only a configured `[source]`; `[migration]` is optional for batching/retry defaults. Import needs `[destination]` and `[migration]` with `destination_root`; it reads the original source identity from the archive, not source credentials. Import works with `--repair`, `--verify-only`, pending-recovery options, and `--skip-destination-tree-deploy`. Normal migration without archive flags remains available. `--path` is required for both archive modes and cannot be used alone.
+All selectable source folders are mapped below the dedicated destination root, such as `Yandex/INBOX`. Rerun the same command to resume or restore missing tracked messages. Normal migration uploads mail and creates/subscribes folders; it does not delete destination messages.
 
-Example layout for source folders `INBOX` and `Arc|Family` (source delimiter `|`):
+Reverse the account roles or choose another destination without editing the INI. Use a dedicated root containing only this migration. Existing messages are adopted by whole-message content after line-ending normalization and duplicate multiplicity, never by Message-ID alone. Unmatched existing destination messages stop copying into that folder.
 
-```text
-archive/
-    archive.metadata
-    snapshot.metadata
-    archive.lock
-    INBOX/
-        folder.metadata
-        uid-000000000123.eml
-        uid-000000000123.metadata
-    Arc/
-        Family/
-            folder.metadata
-            uid-000000000456.eml
-            uid-000000000456.metadata
+### Export a local backup
+
+```bash
+python3 imap-migrator.py export --from yandex --to ./yandex-backup
 ```
 
-EMLs are exact fetched bytes. Each UTF-8 JSON `.metadata` records the source folder, UIDVALIDITY, UID, original INTERNALDATE string and Unix epoch, portable flags, original flags (excluding the session-only `\Recent`), reported RFC822.SIZE, actual byte count, and SHA-256. Folder metadata contains folder identity only, not a collection of message records. The archive header maps original folders to filesystem directories. The snapshot records active folder identities and UIDs only. Empty selectable folders are retained.
+Only the selected source account is connected. Export creates exact fetched EML bytes and metadata, with no SQLite journal. Rerun with the same archive directory to refresh or resume. Add `--full-verify` to re-fetch existing source bodies and compare them with the archive.
 
-Both message files get modification times from the source IMAP INTERNALDATE, including its timezone offset. The timestamp represents one instant; file managers display it in the computer's timezone. The original date/offset remain in metadata. This is not the message's `Date:` header or the filesystem creation time. File access times may change when files are read.
+### Import an archive
 
-Readable folder components are preserved when portable. Windows-reserved names/characters, trailing spaces/dots, overlong or deep paths, case/Unicode-normalization collisions, and archive-reserved filenames use stable generated aliases. Hierarchy delimiters become filesystem separators. Exact original names and delimiters remain in metadata and control import; directory aliases do not rename destination IMAP folders or bypass destination nesting limits. Very deep paths may be represented by a flat alias directory. Keep the archive base path reasonably short on Windows.
+```bash
+python3 imap-migrator.py import --from ./yandex-backup --to hotmail --root Yandex
+```
 
-Rerun export with the same path to refresh/resume. Existing complete pairs are hash checked, their flags metadata is refreshed if needed, and their EML bodies are reused. `--export --full-verify` also fetches existing source bodies and checks that their bytes still match the archive; identical EMLs are not rewritten. Source UIDVALIDITY changes stop export without reassigning old files; use a new archive directory. Export retains old messages/folders removed from the source, but import includes only the latest completed snapshot, not all retained history. This is retained-message backup, not a versioned history of flag changes or multiple independently selectable snapshots.
+Only the destination account is connected. Import validates the completed local snapshot and all active message hashes before connecting, then copies/resumes and performs full destination verification. It can restore to the same account originally exported. Arbitrary EML collections without this script's metadata are not supported.
 
-Each EML is committed before its companion metadata through `.partial` files and atomic replacements. Files are flushed and synced; newly created archive files/directories have private permissions on Unix. An exclusive archive lock prevents simultaneous export/import by this script. Refresh marks the archive incomplete before changing message metadata; interrupted refreshes must finish before import. The previous snapshot file and historical EMLs are retained, but an incomplete archive is deliberately not importable. Files are never automatically removed after upload. SHA-256 detects corruption, not malicious replacement of both a message and its metadata; the archive is not signed or encrypted.
+Export and import can run on different networks, computers or days. Transfer the complete archive directory, including metadata.
 
-Import validates every active EML/metadata pair and hash before destination connection, then reuses normal pending-upload recovery, content comparison, copying, and repair. Full verification is always enabled against the local snapshot. Import uses a separate journal filename with `-import-<archive-id>` inserted before its extension; preserve that journal for resuming. The original live-migration journal is left separate. Restoring to the same provider/account is allowed because the source is an immutable local snapshot; choose the destination root deliberately. Import restores the script's existing portable flags (`\Seen`, `\Answered`, `\Flagged`, `\Draft`) and INTERNALDATE; arbitrary source keywords and `\Deleted` are retained in backup metadata but not applied to destination messages.
+### Verify without uploading or deleting
 
-Verification proves preservation of exported bytes and portable metadata, not that the live source remains unchanged. Export rescans folder/message metadata before marking completion, but IMAP cannot provide an atomic snapshot of an actively changing account. Repeated source changes can require another export attempt. Credentials are never written into the archive. No tests were run for patch 015.
+```bash
+# Compare live accounts.
+python3 imap-migrator.py verify --from yandex --to hotmail --root Yandex --report verification.tsv
+
+# Compare an archive with its destination.
+python3 imap-migrator.py verify --archive ./yandex-backup --to hotmail --root Yandex --report verification.tsv
+```
+
+`verify` always re-fetches complete destination bodies; a live source is independently fetched too. It creates/subscribes no destination folders and uploads/deletes no messages. It refreshes local journal inventories and writes the report. `--from ACCOUNT` and `--archive DIRECTORY` are mutually exclusive.
+
+### Repair tracked destination copies
+
+```bash
+python3 imap-migrator.py repair --archive ./yandex-backup --to hotmail --root Yandex --report repair.tsv
+# Or use --from yandex instead of --archive ./yandex-backup.
+```
+
+Repair works for unfinished migrations too. It restores missing mail and attempts replacements for tracked damaged copies. Old copies are deleted only after replacements pass the existing content/portable-flags/INTERNALDATE repair policy. Selective deletion requires UIDPLUS. Untracked destination messages are not automatically deleted.
+
+Failed candidates and old copies remain journaled. Reruns recheck a surviving candidate instead of appending endless duplicates. A confirmed missing, uncommitted candidate can be retired and uploaded again; committed cleanup records require more conservative recovery. A provider that consistently changes uploaded messages may prevent repair from succeeding.
+
+The repair policy can accept checked-equivalent content; final verification still requires byte equality. A completed repair therefore does not necessarily produce a byte-identical final result.
+
+### Show provider observations
+
+```bash
+python3 imap-migrator.py providers
+```
+
+This command needs no INI or network connection. Destination notices also appear during migration/import/verification/repair.
+
+## Useful options
+
+| Option | Commands | Purpose |
+|---|---|---|
+| `--config PATH` | All | Select the account INI; may precede or follow the command |
+| `--progress` | All | Enable elapsed timestamps, waiting indicators and live statistics |
+| `--log PATH` | All | Append plain status/results; TSV reports hold message details when requested |
+| `--report PATH` | Migration/import/verify/repair | Write a TSV report; **required** for verify and repair |
+| `--journal PATH` | Migration/import/verify/repair | Select an explicit existing/new journal |
+| `--full-verify` | Migrate/export | Re-fetch existing bodies rather than rely on cached content/archive checks |
+| `--skip-tree` | Migrate/import/repair | Skip upfront tree preparation; check/create folders as reached |
+| `--retry-pending` | Migrate/import/repair | Explicit recovery retry when an uncertain upload has no new destination UIDs |
+| `--resolve-pending-uid UID` | Migrate/import/repair | Explicitly identify an uncertain uploaded destination UID after inspecting it |
+
+Use `python3 imap-migrator.py --help` or `python3 imap-migrator.py COMMAND --help` for command-specific help. Progress is off by default; ordinary status output is plain. Copy counters count uploads during the current run, not previously copied messages or verification successes. Import's source-read byte counter measures local archive reads.
+
+## Verification and TSV reports
+
+The final summary separates byte-identical messages, line-ending-only changes, header-only changes and other/uncertain content differences. Categories are mutually exclusive, with percentages based on matched messages. Missing/unmatched source messages, extra/unmatched destination copies, portable flag differences and INTERNALDATE differences are separate counts. Repair runs also report uploaded replacements, completed repairs and failed candidates.
+
+Byte differences remain verification failures even when decoded payloads match. Header-only means different headers with matching decoded MIME structure/payload; it does not validate signatures or prove complete equivalence. Only `\Seen`, `\Answered`, `\Flagged` and `\Draft` are applied to the destination. `\Recent`, `\Deleted` and custom keywords are excluded. INTERNALDATE is the server timestamp, not the message's `Date:` header.
+
+Reports are UTF-8 TSV files readable in a spreadsheet or with tab-delimited tools. Message rows include:
+
+- Phase, status and content category.
+- Source/destination folders, UIDVALIDITY and UIDs; Subjects, Dates and local source EML paths.
+- Original and line-ending-normalized SHA-256 hashes, sizes and line-ending counts.
+- Header fields added/removed/changed, decoded MIME comparison, flags and server dates.
+- Repair state, retained old UID, candidate identifiers and explanatory details.
+
+For header changes, filter **`phase=verification`** and **`content_category=headers_only`**. Repair events use separate rows; count final verification rows when assessing the destination after repair. Unique unmatched content correspondences are explicitly labeled and do not alter journal bindings; ambiguous duplicates are not paired by guesswork.
+
+No per-message display limit applies to reports. Message diagnostics go to TSV rather than flooding the terminal/text log. Reusing a report path overwrites an existing report with the same schema; unrelated existing files are refused. Rows are flushed as written. The final `phase=run` row distinguishes a complete verification pass from an interrupted/failed run. Tabs/newlines/backslashes inside cells are escaped; spreadsheet formula-like strings are stored as text.
+
+Exit codes: **0** verified byte-identical, **1** operation error, **2** verification differences, **130** interrupted. Successful export also returns 0. Migration's normal final pass refreshes metadata but may use cached hashes; use `verify` or `migrate --full-verify` for independent body downloads. Import, verify and repair always use full verification.
+
+## Journals and resuming
+
+Journals are automatically selected under `[defaults] state_dir` (default: `imap-migrator-state` beside the INI). Their identity includes the source/destination server and username, destination root and, for archive operations, the archive ID. Changing direction, destination or root selects a different journal. Aliases, passwords and command names do not change the identity: verify/repair reuse the corresponding migration/import journal.
+
+Keep the state directory across runs and keep it with the INI when moving installations. A journal stores hashes, UIDs, flags, dates and bindings, not credentials or message bodies. Journals and newly created archive files use private Unix permissions. Locks prevent simultaneous use of a journal/archive; read commands retry with bounded backoff.
+
+Use `--journal PATH` if you want to choose a journal location explicitly; use the same path for subsequent related commands. A journal rejects different accounts, roots or archive identities. Keep it when recovering pending uploads or failed candidates.
+
+APPEND intent is recorded before uploading, and acknowledged UIDs are saved durably. An uncertain upload is never blindly retried. If recovery cannot identify its result uniquely, it stops with the pending record retained. `--retry-pending` allows one explicit retry only when repeated inventories find no new destination UIDs; a delayed server commit still carries duplicate risk. If candidate UIDs exist, inspect raw messages before using `--resolve-pending-uid UID`. These two options are mutually exclusive and unavailable in `verify`.
+
+## Archive format
+
+Each message uses `uid-000000000123.eml` and a companion `.metadata` file, independent of potentially unsafe subject text. `folder.metadata` records folder identity; `archive.metadata` records source identity and filesystem mappings; `snapshot.metadata` lists the latest completed snapshot. Preserve all metadata for import.
+
+Message metadata includes original UID/UIDVALIDITY, folder, flags, INTERNALDATE with timezone, byte counts and SHA-256. EML/metadata modification times use INTERNALDATE; folder metadata and directories use the newest message timestamp. File managers display timestamps in the local timezone.
+
+Portable folder names remain readable. Reserved names, unsafe characters, excessive path depth and case/Unicode collisions use stable aliases; exact source names stay in metadata. Aliases do not bypass destination IMAP nesting limits.
+
+Export refreshes add new messages, check existing files and update metadata. Files removed from the source are retained locally, but import restores only the latest completed snapshot. This is not selectable historical snapshots or a version history of flag changes. An interrupted refresh must finish before import; source UIDVALIDITY changes require a new archive directory.
+
+Writes use synced temporary files and atomic replacements. Archives are not automatically deleted after upload and contain no credentials. SHA-256 detects accidental corruption; the archive is not signed or encrypted. Keep an independent backup.
+
+## Provider notices and limits
+
+Provider notices record observations, not universal guarantees. Current examples include Outlook/Hotmail header normalization, Gmail line-ending rewriting and slow uploads, and GMX's observed three-level folder hierarchy limit, counting the destination root. Unknown hosts are explicitly marked unknown. Notices never relax verification or authorize duplicate matching.
+
+Upfront destination-tree preparation creates missing parents, checks writable selection and subscribes folders for client visibility before uploading/deleting messages. Subscription failures warn; quota and message acceptance are still checked during transfer. `--skip-tree` skips this preflight, so later folder errors can occur after earlier folders have copied.
+
+Keep the source and dedicated destination root stable during migration/verification. IMAP does not provide an atomic account snapshot. Unsupported hierarchy delimiters, namespace ambiguity and mapping collisions are rejected; source-folder aliases are not silently invented for the destination.
+
+Transfers overlap bounded source prefetch with serial destination uploads. Defaults are 25 messages/16 MiB per batch; a larger single message is handled alone. Multiple batches and MIME parsing can coexist in memory. No MULTIAPPEND, parallel destination sessions or guaranteed provider-independent throughput is promised.
