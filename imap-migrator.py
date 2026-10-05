@@ -1383,6 +1383,22 @@ class Journal:
             self.db.execute('DELETE FROM repairs WHERE sf=? AND sv=? AND su=?',
                 (task['sf'],task['sv'],task['su']))
 
+    def retire_missing_repair(self, task, surviving_old):
+        # Update the binding and retire the vanished candidate atomically. No
+        # destination STORE/EXPUNGE is authorized by this journal transition.
+        with self.db:
+            if surviving_old is not None:
+                self.db.execute('INSERT INTO bindings VALUES (?,?,?,?,?,?) '
+                    'ON CONFLICT(sf,sv,su) DO UPDATE SET df=excluded.df,dv=excluded.dv,du=excluded.du',
+                    tuple(task[key] for key in ('sf','sv','su','df','dv'))+(surviving_old,))
+            else:
+                self.db.execute('DELETE FROM bindings WHERE sf=? AND sv=? AND su=?',
+                    tuple(task[key] for key in ('sf','sv','su')))
+            self.db.execute('DELETE FROM repairs WHERE sf=? AND sv=? AND su=?',
+                tuple(task[key] for key in ('sf','sv','su')))
+            self.db.execute('DELETE FROM cache WHERE side=? AND folder=? AND validity=? AND uid=?',
+                ('destination',task['df'],task['dv'],task['new_du']))
+
 
 @dataclass
 class Options:
@@ -2225,7 +2241,39 @@ def finish_repair(src, dst, journal, task, diagnostic_state=None):
     if du == task.get('old_du'):
         raise RuntimeError('Repair candidate equals old UID; no destination copy deleted')
     if du not in destination:
-        raise RuntimeError('Repair candidate disappeared; retained copies require review')
+        # An acknowledged UID confirmed absent is not an ambiguous APPEND.
+        # Retire an uncommitted candidate without deleting the old copy.
+        # Committed cleanup may already have marked/expunged the old UID, so
+        # it must not be rolled back as if no replacement had been committed.
+        state = task.get('state')
+        if state not in ('candidate', 'cleanup'):
+            raise RuntimeError('Unknown repair state; missing candidate record retained')
+        if state == 'cleanup':
+            raise RuntimeError(f'Committed repair replacement UID {du} disappeared in {df!r}. '
+                'Cleanup record retained; old copy may already be marked deleted or expunged. '
+                'No automatic rollback/deletion attempted; review this committed repair separately.')
+        current = journal.db.execute('SELECT df,dv,du FROM bindings WHERE sf=? AND sv=? AND su=?',
+                                     (sf,sv,su)).fetchone()
+        old = task.get('old_du')
+        if current is not None:
+            if current[:2] != (df,dv):
+                raise RuntimeError('Repair binding destination changed; missing candidate record retained')
+            if current[2] in destination and current[2] != old:
+                raise RuntimeError('Repair binding points to another surviving UID; record retained')
+        surviving_old = old if old is not None and old in destination else None
+        if surviving_old is not None:
+            previous = dst.fetch([old])[old]
+            if previous['strict'] != task['old_strict']:
+                raise RuntimeError('Old repair target content changed; missing candidate record retained')
+        fresh = dst.snapshot()
+        if du in fresh or (surviving_old is not None and surviving_old not in fresh):
+            raise RuntimeError('Destination changed while confirming missing repair candidate; record retained')
+        journal.save('source', sf, sv, source)
+        journal.retire_missing_repair(task, surviving_old)
+        log(f'  Repair candidate UID {du} is confirmed missing in {df!r} (state={state}). '
+            + (f'Old UID {surviving_old} retained; ' if surviving_old is not None else 'No old copy remains; ')
+            + f'source UID {su} will be uploaded again. No destination message deleted.')
+        return None
     target = dst.fetch([du])[du]
     journal.save('source', sf, sv, source)
     journal.save('destination', df, dv, target)
@@ -2258,12 +2306,14 @@ def finish_repair(src, dst, journal, task, diagnostic_state=None):
 def repair_folder(src, dst, journal, folder, df, delim, opts):
     ensure_folder(dst, df, delim)
     diagnostic_state = [0]
-    # Resume outstanding candidates/cleanup first; never append a second candidate.
+    retry_missing = set()
+    # Reuse surviving candidates; confirmed missing candidates can be retired.
     for task in journal.repair_rows():
         if task['sf'] == folder.name:
             if task['df'] != df:
                 raise RuntimeError('Repair destination differs from current folder mapping')
-            finish_repair(src, dst, journal, task, diagnostic_state)
+            if finish_repair(src, dst, journal, task, diagnostic_state) is None:
+                retry_missing.add(task['su'])
     sv, source = inventory(src, journal, 'source', folder.name, opts, full=True)
     dv, destination = inventory(dst, journal, 'destination', df, opts, full=True)
     bound = journal.bindings(folder.name, sv, df, dv)
@@ -2295,7 +2345,7 @@ def repair_folder(src, dst, journal, folder, df, delim, opts):
             continue  # Already rechecked above; failed candidate remains journaled.
         old = bound.get(su)
         previous = destination.get(old)
-        if previous is not None and repair_matches(expected, previous):
+        if su not in retry_missing and previous is not None and repair_matches(expected, previous):
             continue
         if previous is not None:
             dst.require_uid_expunge()  # Refuse before uploading if selective cleanup is impossible.
@@ -2303,6 +2353,8 @@ def repair_folder(src, dst, journal, folder, df, delim, opts):
         if (rec['strict'],rec['flags'],rec['epoch']) != (expected['strict'],expected['flags'],expected['epoch']):
             raise RuntimeError('Source changed during repair; rerun for a fresh snapshot')
         journal.save('source', folder.name, sv, rec)
+        log(f'  Uploading repair replacement: {folder.name!r} source UID {su} '
+            f'-> {df!r}; {len(rec["raw"]):,} original bytes', flush=True)
         if time.monotonic()-dst.last_activity > 30:
             dst.read('pre-repair NOOP', lambda c: require_ok(c.noop(), 'NOOP'))
         task = dict(kind='repair', sf=folder.name, sv=sv, su=su, df=df, dv=dv,
