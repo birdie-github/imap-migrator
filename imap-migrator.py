@@ -81,6 +81,7 @@ OUTPUT_LOCK = threading.RLock()
 _progress_rows = 0
 _progress_columns = None
 LOG_FILE = None
+PROGRESS_ENABLED = False
 
 
 def elapsed_stamp():
@@ -92,8 +93,12 @@ def elapsed_stamp():
 
 
 def log(*args, sep=' ', end='\n', file=None, flush=True, file_only=False,
-        to_log=True, log_text=None):
+        to_log=True, log_text=None, progress_only=False):
     global _progress_rows, LOG_FILE
+    if progress_only:
+        if not PROGRESS_ENABLED:
+            return
+        to_log = False
     stream = sys.stdout if file is None else file
     text = sep.join(str(arg) for arg in args)
     # Diagnostic file output is plain and independent of terminal timestamps.
@@ -103,8 +108,11 @@ def log(*args, sep=' ', end='\n', file=None, flush=True, file_only=False,
         # terminal redraws from erasing diagnostics (including worker messages).
         if not file_only:
             _progress_rows = 0
-        stamp = elapsed_stamp()
-        text = '\n'.join(stamp+' '+line if line else '' for line in text.split('\n'))
+        stamp = elapsed_stamp()+' ' if PROGRESS_ENABLED else ''
+        if PROGRESS_ENABLED:
+            text = '\n'.join(stamp+line if line else '' for line in text.split('\n'))
+        else:
+            text = file_text  # Plain mode shares the same text with the file log.
         if not file_only:
             builtins.print(text, end=end, file=stream, flush=flush)
         if to_log and LOG_FILE is not None:
@@ -114,7 +122,7 @@ def log(*args, sep=' ', end='\n', file=None, flush=True, file_only=False,
                 failed_log, LOG_FILE = LOG_FILE, None
                 with contextlib.suppress(OSError):
                     failed_log.close()
-                builtins.print(stamp+' WARNING: log file write failed; file logging disabled: '+str(exc),
+                builtins.print(stamp+'WARNING: log file write failed; file logging disabled: '+str(exc),
                                file=sys.stderr, flush=True)
 
 
@@ -1446,7 +1454,8 @@ def inventory(s, journal, side, folder, opts, full=False):
             missing.append(uid)
     if missing:
         label = 'local archive' if isinstance(s, ArchiveSource) else side
-        log(f'  {label}: hashing {len(missing)} messages ({len(records)-len(missing)} cached)', flush=True)
+        log(f'  {label}: hashing {len(missing)} messages ({len(records)-len(missing)} cached)',
+            flush=True, progress_only=True)
         progress = HashProgress(len(missing), len(records)-len(missing), label)
         progress.show(True)
         with Prefetch(s, records, missing, opts, on_wait=progress.show) as stream:
@@ -1688,7 +1697,7 @@ class Progress:
 
     def show(self, force=False):
         global _progress_rows, _progress_columns
-        if self.folder_total == 0:
+        if not PROGRESS_ENABLED or self.folder_total == 0:
             return
         now = time.monotonic()
         live = sys.stdout.isatty() and os.environ.get('TERM') != 'dumb'
@@ -1800,7 +1809,7 @@ class OperationStatus(Progress):
     def __enter__(self):
         # Prefetch already has its own consumer progress. Nested reads belong
         # to the outer operation, so only one timer can redraw the terminal.
-        self.enabled = (threading.current_thread() is threading.main_thread()
+        self.enabled = (PROGRESS_ENABLED and threading.current_thread() is threading.main_thread()
                         and not getattr(OPERATION_STATE, 'active', False))
         if self.enabled:
             OPERATION_STATE.active = True
@@ -1872,7 +1881,7 @@ class ArchiveProgress(Progress):
         if not total:
             log('  Empty folder; no message files to '+self.operation+'.')
             return
-        log(f'  Folder: {total} messages to {self.operation}')
+        log(f'  Folder: {total} messages to {self.operation}', progress_only=True)
         self.show(True)
 
     def reused_message(self):
@@ -2031,7 +2040,7 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
                 if diagnostic_count >= MESSAGE_DIAGNOSTIC_LIMIT and not diagnostic_suppressed:
                     log(f'  Further changed-message details suppressed for {df!r} '
                         f'(limit {MESSAGE_DIAGNOSTIC_LIMIT}); counts and journal mappings are retained.',
-                        to_log=False)
+                        to_log=True)
                     diagnostic_suppressed = True
                 diagnostic_count += 1
                 if not diagnosed and summary is not None:
@@ -2157,7 +2166,7 @@ def verify_folder(src, dst, j, f, df, opts):
     if len(different_pairs) > len(terminal_uids):
         log(f'  {df!r}: terminal details shown for {len(terminal_uids)}/{len(different_pairs)} '
             f'differing mapped messages; {len(different_pairs)-len(terminal_uids)} suppressed on terminal. '
-            'All differences are counted; all UID mappings remain in the journal.', to_log=False)
+            'All differences are counted; all UID mappings remain in the journal.')
     # Detect changes throughout body scans, including concurrent deletions/arrivals.
     def stable(s, recs):
         snap = s.snapshot()
@@ -2201,7 +2210,7 @@ def show_repair_difference(src, task, source, target, diagnostic_state):
     if file_only and count == MESSAGE_DIAGNOSTIC_LIMIT:
         log(f'  Further detailed repair diagnostics suppressed on terminal '
             f'(limit {MESSAGE_DIAGNOSTIC_LIMIT} per folder); '
-            'use --log-file for every failed candidate. Failure summaries remain visible.', to_log=False)
+            'use --log-file for every failed candidate. Failure summaries remain visible.')
     if file_only and LOG_FILE is None:
         return
     show_message_identity(src, task['sf'], task['sv'], task['su'], task['df'],
@@ -2668,10 +2677,11 @@ def export_archive(src, root, opts):
     folders.sort(key=lambda f: (f.name.casefold() != 'inbox', f.name.casefold()))
     if not folders:
         raise RuntimeError('Source has no selectable folders')
-    log('Counting source messages and checking folder identities before updating archive...')
+    log('Counting source messages and checking folder identities before updating archive...',
+        progress_only=True)
     validities, initial_counts = {}, {}
     for index, folder in enumerate(folders, 1):
-        log(f'  Counting [{index}/{len(folders)}] {folder.name!r}')
+        log(f'  Counting [{index}/{len(folders)}] {folder.name!r}', progress_only=True)
         validity = src.select(folder.name)
         previous = archive['folders'].get(folder.name)
         if previous and previous['delimiter'] != folder.delimiter:
@@ -2839,7 +2849,8 @@ class ArchiveSource:
             self.entries[name] = entry
             records = {}
             self.content_hashes[name] = {}
-            log(f'  Validating {name!r}: {len(uids)} messages')
+            log(f'  Validating {name!r}: {len(uids)} messages',
+                log_text=f'  Validating {name!r}')
             validation.begin_archive_folder(len(uids))
             for uid in uids:
                 check_stop()
@@ -2899,7 +2910,7 @@ class ArchiveSource:
 
 
 def main(argv=None):
-    global CONFIG_PATH, _stop_requested, RUN_STARTED, _progress_rows, LOG_FILE
+    global CONFIG_PATH, _stop_requested, RUN_STARTED, _progress_rows, LOG_FILE, PROGRESS_ENABLED
     RUN_STARTED = time.monotonic()
     _progress_rows = 0
     parser = argparse.ArgumentParser(description=__doc__,
@@ -2917,7 +2928,9 @@ def main(argv=None):
     parser.add_argument('--provider-notes', action='store_true', help='Show observed provider preservation behavior and exit')
     parser.add_argument('--config', type=Path, help='INI path (default: beside script)')
     parser.add_argument('--log-file', type=Path,
-        help='Append timestamped status, periodic progress and all changed-message identities/Subjects/Dates to this UTF-8 file')
+        help='Append plain status/results and all changed-message diagnostics to this UTF-8 file; terminal detail limits do not apply')
+    parser.add_argument('--progress', action='store_true',
+        help='Show elapsed timestamps, waiting indicators, live counts, transfer rates and copy time on the terminal (off by default)')
     parser.add_argument('--skip-destination-tree-deploy', action='store_true',
         help='Skip upfront folder creation, writable-selection checks and subscriptions; folders are still checked/created as reached during copying or repair')
     parser.add_argument('--full-verify', action='store_true', help='Re-download both sides for independent content verification')
@@ -2926,6 +2939,7 @@ def main(argv=None):
     parser.add_argument('--repair', action='store_true', help='Copy/resume plus verified repair/deletion of damaged copies; implies --full-verify')
     parser.add_argument('--verify-only', action='store_true', help='Verify without creating folders or uploading messages')
     args = parser.parse_args(argv)
+    PROGRESS_ENABLED = args.progress
     if (args.export_archive or args.import_archive) != (args.path is not None):
         parser.error('--path is required with --export/--import and cannot be used without them')
     if args.export_archive and (args.repair or args.verify_only or args.retry_pending
@@ -3024,15 +3038,16 @@ def main(argv=None):
                     '(full verification is implied), or inspect with --verify-only --full-verify.')
             if any(task['sf'] not in names or task['df'] != names[task['sf']] for task in tasks):
                 raise RuntimeError('Outstanding repair falls outside current migration folder mappings')
-            log('Counting source messages...', flush=True)
+            log('Counting source messages...', flush=True, progress_only=True)
             total = 0
             folder_counts = {}
             for n, f in enumerate(folders, 1):
-                log(f'  Counting [{n}/{len(folders)}] {f.name!r}', flush=True)
+                log(f'  Counting [{n}/{len(folders)}] {f.name!r}', flush=True, progress_only=True)
                 src.select(f.name)
                 folder_counts[f.name] = len(src.snapshot())
                 total += folder_counts[f.name]
-            log(f'Source: {total:,} messages in {len(folders):,} folders. Destination root: {root!r}')
+            log(f'Source: {total:,} messages in {len(folders):,} folders. Destination root: {root!r}',
+                progress_only=True)
             progress = CopyProgress(total, folder_counts)
             for n,f in enumerate(folders,1):
                 log(f'\n[{n}/{len(folders)}] {f.name!r} -> {names[f.name]!r}', flush=True)
