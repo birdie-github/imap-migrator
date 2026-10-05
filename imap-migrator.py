@@ -877,6 +877,17 @@ def equivalent(a, b):
 
 # Observations, not guarantees or allowlists. Add entries only with evidence.
 PROVIDER_NOTES = [
+    dict(provider='Google Gmail', hosts=('imap.gmail.com', 'imap.googlemail.com'),
+         observed='2026-10-05',
+         behavior='Very slow IMAP uploads observed: about 0.25-0.3 copied messages/second '
+                  '(roughly one message every 3-4 seconds). Changing networks did not '
+                  'resolve the reported slowness.',
+         scope='User reports across two ISPs and ten VPN locations. Supplied import logs '
+               'show 0.3 copied messages/second and approximately 25 KiB/second. '
+               'Rates measure end-to-end migration work, including verification and other '
+               'processing; they do not isolate APPEND latency or establish a fixed Gmail '
+               'throttling rule. Results may differ by account, message sizes, workload '
+               'and server conditions. This performance observation makes no byte-preservation claim.'),
     dict(provider='Microsoft Outlook/Hotmail', hosts=('outlook.office365.com',),
          observed='2026-10-04',
          behavior='Observed: trims address/date header whitespace; adds recipient angle brackets; '
