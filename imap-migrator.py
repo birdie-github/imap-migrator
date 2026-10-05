@@ -1139,8 +1139,9 @@ def batches(records, ids, max_count, max_bytes):
 
 class Prefetch:
     """Bounded producer; source connection remains owned by its worker."""
-    def __init__(self, session, records, ids, opts):
+    def __init__(self, session, records, ids, opts, on_wait=None):
         self.s, self.records, self.ids, self.opts = session, records, ids, opts
+        self.on_wait = on_wait
         self.q = queue.Queue(maxsize=1)
         self.cancel = threading.Event()
         self.finished = threading.Event()
@@ -1190,6 +1191,9 @@ class Prefetch:
                     if self.error is not None:
                         raise self.error
                     return
+                if self.on_wait is not None:
+                    # Run only in the consumer, never in the connection worker.
+                    self.on_wait()
                 continue
             yield from item
 
@@ -1372,11 +1376,16 @@ def inventory(s, journal, side, folder, opts, full=False):
         else:
             missing.append(uid)
     if missing:
-        log(f'  {side}: hashing {len(missing)} messages ({len(records)-len(missing)} cached)', flush=True)
-        with Prefetch(s, records, missing, opts) as stream:
+        label = 'local archive' if isinstance(s, ArchiveSource) else side
+        log(f'  {label}: hashing {len(missing)} messages ({len(records)-len(missing)} cached)', flush=True)
+        progress = HashProgress(len(missing), len(records)-len(missing), label)
+        progress.show(True)
+        with Prefetch(s, records, missing, opts, on_wait=progress.show) as stream:
             for rec in stream:
                 journal.save(side, folder, validity, rec)
                 records[rec['uid']] = {k:v for k,v in rec.items() if k != 'raw'}
+                progress.hashed_message(len(rec['raw']))
+        progress.show(True)
     return validity, records
 
 
@@ -1630,6 +1639,29 @@ class Progress:
             f'  Speed: {self.copied/elapsed:.1f} copied msg/s | uploaded={human_bytes(self.uploaded)} '
             f'({human_bytes(int(self.uploaded/elapsed))}/s) | fetched={human_bytes(self.downloaded)} | '
             f'copy elapsed={human_duration(elapsed)}']
+
+
+class HashProgress(Progress):
+    """Folder inventory progress, separate from copied-message counters."""
+    def __init__(self, total, cached, label):
+        super().__init__(total)
+        self.folder_total = total
+        self.cached, self.label = cached, label
+
+    def hashed_message(self, size):
+        self.done += 1
+        self.downloaded += size
+        self.show()
+
+    def progress_lines(self, elapsed):
+        # Bytes/counts advance only after a fetched batch has been parsed and
+        # each record journaled. Elapsed time also advances while awaiting it.
+        return [
+            f'  {self.label}: {self.done}/{self.total} hashed | '
+            f'{max(0,self.total-self.done)} left | {self.cached} cached',
+            f'  Read={human_bytes(self.downloaded)} '
+            f'({human_bytes(int(self.downloaded/elapsed))}/s) | '
+            f'hashing elapsed={elapsed:.2f}s']
 
 
 class ArchiveProgress(Progress):
