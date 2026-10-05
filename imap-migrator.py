@@ -893,13 +893,19 @@ PROVIDER_NOTES = [
          observed='2026-10-05',
          behavior='Very slow IMAP uploads observed: about 0.25-0.3 copied messages/second '
                   '(roughly one message every 3-4 seconds). Changing networks did not '
-                  'resolve the reported slowness.',
+                  'resolve the reported slowness. Some uploaded messages returned with '
+                  'LF line endings converted to CRLF; original message bytes were not preserved.',
          scope='User reports across two ISPs and ten VPN locations. Supplied import logs '
                'show 0.3 copied messages/second and approximately 25 KiB/second. '
                'Rates measure end-to-end migration work, including verification and other '
                'processing; they do not isolate APPEND latency or establish a fixed Gmail '
                'throttling rule. Results may differ by account, message sizes, workload '
-               'and server conditions. This performance observation makes no byte-preservation claim.'),
+               'and server conditions. User message comparisons and repair diagnostics '
+               'also show line-ending-only changes in a subset of imported messages; '
+               'not every message was rewritten, and reuploading affected originals '
+               'did not reliably restore byte equality. This is an observation, not a '
+               'guarantee about every Gmail account/message. Full verification still '
+               'reports these messages as different bytes.'),
     dict(provider='Microsoft Outlook/Hotmail', hosts=('outlook.office365.com',),
          observed='2026-10-04',
          behavior='Observed: trims address/date header whitespace; adds recipient angle brackets; '
@@ -2110,7 +2116,7 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
         raise RuntimeError(f'{f.name!r}: source changed during migration; rerun for a fresh snapshot')
 
 
-def verify_folder(src, dst, j, f, df, opts):
+def verify_folder(src, dst, j, f, df, opts, totals=None):
     sv, source = inventory(src, j, 'source', f.name, opts, full=opts.full_verify)
     dv, dest = inventory(dst, j, 'destination', df, opts, full=opts.full_verify)
     def counter(records, metadata=False, strict=False):
@@ -2140,6 +2146,20 @@ def verify_folder(src, dst, j, f, df, opts):
     # Count metadata differences only among content-matched unmatched copies;
     # absent or extra mail is already represented by missing/extra counts.
     meta += sum((sc & dc).values()) - sum((sm & dm).values())
+    canonical_matches = sum((sc & dc).values())
+    line_endings = sum(source[su]['strict'] != dest[du]['strict'] and
+        source[su]['canon'] == dest[du]['canon'] for su, du in mapped.items())
+    line_endings += canonical_matches - unmatched_strict
+    headers_only = other_content = 0
+    def metadata_differences(key):
+        known = sum(source[su][key] != dest[du][key] for su, du in mapped.items())
+        def values(records):
+            return collections.Counter((rec['canon'], tuple(rec[key]) if key == 'flags'
+                                        else rec[key]) for rec in records.values())
+        return known + canonical_matches - sum((values(unmatched_source) &
+                                                values(unmatched_dest)).values())
+    flag_differences = metadata_differences('flags')
+    date_differences = metadata_differences('epoch')
     # Report every known mismatching pair, even when other bindings are missing.
     # Never infer a pairing from a Message-ID or an unmatched content count.
     different_pairs = {}
@@ -2153,11 +2173,14 @@ def verify_folder(src, dst, j, f, df, opts):
             differences.append('INTERNALDATE')
         if differences:
             different_pairs[su] = (du, differences)
-    # Body diagnostics share the repair reporter. Bound each read batch and
-    # only fetch pairs that will be displayed or written to the requested log.
+    # All non-normalized content changes need MIME classification for the final
+    # totals, even when terminal details are capped and no log was requested.
     terminal_uids = set(sorted(different_pairs)[:MESSAGE_DIAGNOSTIC_LIMIT])
-    diagnostic_uids = sorted(different_pairs) if LOG_FILE is not None else sorted(terminal_uids)
-    for ids in batches(source, diagnostic_uids, opts.batch_messages, opts.batch_bytes):
+    diagnostic_uids = set(different_pairs) if LOG_FILE is not None else terminal_uids
+    classify_uids = {su for su, du in mapped.items()
+                     if source[su]['canon'] != dest[du]['canon']}
+    for ids in batches(source, sorted(diagnostic_uids | classify_uids),
+                       opts.batch_messages, opts.batch_bytes):
         originals = src.fetch(ids)
         returned = dst.fetch([different_pairs[su][0] for su in ids])
         for su in ids:
@@ -2166,9 +2189,19 @@ def verify_folder(src, dst, j, f, df, opts):
             for fresh, recorded in ((original, source[su]), (target, dest[du])):
                 if any(fresh[key] != recorded[key] for key in ('strict', 'flags', 'epoch')):
                     raise RuntimeError('Message changed during verification diagnostics; rerun verification')
-            show_pair_difference(src, f.name, sv, su, df, dv, du, original, target,
-                reason='Verification difference: '+', '.join(differences),
-                file_only=su not in terminal_uids)
+            if su in classify_uids:
+                sh, dh = content_summary(original['raw']), content_summary(target['raw'])
+                def normalized_headers(raw):
+                    return raw.replace(b'\r\n', b'\n').replace(b'\r', b'\n').partition(b'\n\n')[0]
+                if (sh is not None and dh is not None and sh['mime'] == dh['mime']
+                        and normalized_headers(original['raw']) != normalized_headers(target['raw'])):
+                    headers_only += 1
+                else:
+                    other_content += 1
+            if su in diagnostic_uids:
+                show_pair_difference(src, f.name, sv, su, df, dv, du, original, target,
+                    reason='Verification difference: '+', '.join(differences),
+                    file_only=su not in terminal_uids)
     if len(different_pairs) > len(terminal_uids):
         log(f'  {df!r}: terminal details shown for {len(terminal_uids)}/{len(different_pairs)} '
             f'differing mapped messages; {len(different_pairs)-len(terminal_uids)} suppressed on terminal. '
@@ -2188,7 +2221,47 @@ def verify_folder(src, dst, j, f, df, opts):
           f'changed-or-uncertain={changed-equivalent_count} missing={missing} extra={extra} '
           f'flag/date differences={meta} stable={stable_source and stable_dest}: '
           + status, flush=True)
+    if totals is not None:
+        totals.update(source=len(source), destination=len(dest),
+            checked=strict+line_endings+headers_only+other_content,
+            identical=strict, line_endings=line_endings, headers=headers_only,
+            other=other_content, missing=missing, extra=extra,
+            flags=flag_differences, dates=date_differences,
+            unstable_folders=int(not (stable_source and stable_dest)))
     return ok
+
+
+def show_verification_totals(totals, *, full, repair_stats=None, outstanding=0,
+                             folder_tree_changed=False):
+    log('\nVerification summary'+(' (after repair)' if repair_stats is not None else '')+':')
+    log('  Content checks: '+('independent full body download' if full else
+                             'live metadata with cached content hashes'))
+    log(f'  Source:  {totals["source"]:,} messages')
+    log(f'  Checked: {totals["checked"]:,} matched messages')
+    labels = [('Byte identical', 'identical'),
+              ('Different line endings only', 'line_endings'),
+              ('Different headers only', 'headers'),
+              ('Other content differences', 'other')]
+    width = max(len(label) for label, key in labels)
+    count_width = max(1, len(f'{totals["checked"]:,}'))
+    for label, key in labels:
+        percentage = 100 * totals[key] / totals['checked'] if totals['checked'] else 0
+        log(f'  {label+":":<{width+1}} {totals[key]:>{count_width},} messages ({percentage:5.1f}%)')
+    log('  Percentages use matched messages; missing/unmatched mail is excluded.')
+    log('  Header-only means changed headers with matching decoded MIME structure/payload; '
+        'these categories do not relax byte verification.')
+    log(f'  Missing/unmatched source: {totals["missing"]:,} messages')
+    log(f'  Extra/unmatched destination: {totals["extra"]:,} messages')
+    log(f'  Flag differences: {totals["flags"]:,} messages')
+    log(f'  INTERNALDATE differences: {totals["dates"]:,} messages')
+    if totals['unstable_folders'] or folder_tree_changed:
+        log(f'  Snapshot changed: {totals["unstable_folders"]:,} folders; '
+            f'folder tree changed={folder_tree_changed}. Counts are not a stable final state.')
+    if repair_stats is not None:
+        log(f'  Repair replacements uploaded this run: {repair_stats["uploaded"]:,}')
+        log(f'  Repairs completed this run: {repair_stats["completed"]:,}')
+        log(f'  Candidates failing verification this run: {repair_stats["failed"]:,}')
+        log(f'  Outstanding repair records: {outstanding:,}')
 
 
 # ------------------------- verified repair -----------------------------------
@@ -2256,7 +2329,7 @@ def show_pair_difference(src, sf, sv, su, df, dv, du, source, target, *,
                 file_only=file_only, label='Message difference')
 
 
-def finish_repair(src, dst, journal, task, diagnostic_state=None):
+def finish_repair(src, dst, journal, task, diagnostic_state=None, repair_stats=None):
     """Resume a candidate or committed cleanup without issuing another APPEND."""
     sf, sv, su, df, dv = (task[key] for key in ('sf','sv','su','df','dv'))
     if src.select(sf) != sv or dst.select(df) != dv:
@@ -2308,6 +2381,8 @@ def finish_repair(src, dst, journal, task, diagnostic_state=None):
     journal.save('source', sf, sv, source)
     journal.save('destination', df, dv, target)
     if not repair_matches(source, target):
+        if repair_stats is not None:
+            repair_stats['failed'] += 1
         log(f'  REPAIR FAILED: {sf!r} source UID {su}, candidate UID {du}. '
               f'Content: {repair_content_description(source, target)}; '
               f'flags={"MATCH" if source["flags"] == target["flags"] else "DIFFER"}; '
@@ -2328,12 +2403,14 @@ def finish_repair(src, dst, journal, task, diagnostic_state=None):
     if old is not None and old in destination:
         dst.delete_uid(df, dv, old)
     journal.finish_repair(task)
+    if repair_stats is not None:
+        repair_stats['completed'] += 1
     log(f'  REPAIRED: {sf!r} source UID {su} -> destination UID {du}' +
           (f'; removed old UID {old}' if old is not None and old in destination else '; missing message restored'), flush=True)
     return True
 
 
-def repair_folder(src, dst, journal, folder, df, delim, opts):
+def repair_folder(src, dst, journal, folder, df, delim, opts, repair_stats=None):
     ensure_folder(dst, df, delim)
     diagnostic_state = [0]
     retry_missing = set()
@@ -2342,7 +2419,7 @@ def repair_folder(src, dst, journal, folder, df, delim, opts):
         if task['sf'] == folder.name:
             if task['df'] != df:
                 raise RuntimeError('Repair destination differs from current folder mapping')
-            if finish_repair(src, dst, journal, task, diagnostic_state) is None:
+            if finish_repair(src, dst, journal, task, diagnostic_state, repair_stats) is None:
                 retry_missing.add(task['su'])
     sv, source = inventory(src, journal, 'source', folder.name, opts, full=True)
     dv, destination = inventory(dst, journal, 'destination', df, opts, full=True)
@@ -2409,7 +2486,9 @@ def repair_folder(src, dst, journal, folder, df, delim, opts):
                 reconcile(dst, journal, opts)
         task = next(task for task in journal.repair_rows()
                     if (task['sf'],task['sv'],task['su']) == (folder.name,sv,su))
-        finish_repair(src, dst, journal, task, diagnostic_state)
+        if repair_stats is not None:
+            repair_stats['uploaded'] += 1
+        finish_repair(src, dst, journal, task, diagnostic_state, repair_stats)
         # Refresh live metadata without discarding the content fingerprints.
         live = dst.snapshot()
         if set(live) - set(destination) - {task['new_du']}:
@@ -2979,6 +3058,7 @@ def main(argv=None):
     signal.signal(signal.SIGINT, _request_stop)
     signal.signal(signal.SIGTERM, _request_stop)
     src = dst = journal = archive_lock = None
+    repair_stats = collections.Counter() if args.repair else None
     # Applies to the SQLite journal and sidecars, without changing existing INI permissions.
     previous_umask = os.umask(0o077)
     try:
@@ -3069,23 +3149,29 @@ def main(argv=None):
             for n,f in enumerate(folders,1):
                 log(f'\n[{n}/{len(folders)}] {f.name!r} -> {names[f.name]!r}', flush=True)
                 if args.repair:
-                    repair_folder(src,dst,journal,f,names[f.name],delim,opts)
+                    repair_folder(src,dst,journal,f,names[f.name],delim,opts,repair_stats)
                 else:
                     migrate_folder(src,dst,journal,f,names[f.name],delim,opts,progress)
         elif journal.pending():
             raise RuntimeError('A pending APPEND exists. Resume migration to reconcile it first.')
         log('\nVerification: '+('independent full body download' if opts.full_verify else 'live UID/metadata checks with cached content hashes'))
         ok = True
+        verification_totals = collections.Counter()
         for n, f in enumerate(folders, 1):
             log(f'  Verifying [{n}/{len(folders)}] {f.name!r} -> {names[f.name]!r}', flush=True)
-            result = verify_folder(src,dst,journal,f,names[f.name],opts)
+            result = verify_folder(src,dst,journal,f,names[f.name],opts,verification_totals)
             ok = result and ok
         # New folders also invalidate the result; no silent omission of arriving mailboxes.
         final_folders = {f.name for f in src.folders() if r'\noselect' not in f.flags}
-        ok = ok and final_folders == {f.name for f in folders}
-        if journal.repair_rows():
+        folder_tree_changed = final_folders != {f.name for f in folders}
+        ok = ok and not folder_tree_changed
+        outstanding = len(journal.repair_rows())
+        if outstanding:
             ok = False
             log('Outstanding repair candidates remain; no failed replacement was used to delete an old copy.')
+        show_verification_totals(verification_totals, full=opts.full_verify,
+            repair_stats=repair_stats, outstanding=outstanding,
+            folder_tree_changed=folder_tree_changed)
         log('\nFINAL RESULT: '+('VERIFIED' if ok else 'VERIFICATION DIFFERENCES DETECTED (see folder results)'))
         return 0 if ok else 2
     except KeyboardInterrupt:
