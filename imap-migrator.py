@@ -1024,6 +1024,11 @@ class Session:
                 raise RuntimeError(f'{self.label}: UIDVALIDITY changed after reconnect; restart to rescan')
 
     def read(self, operation, func):
+        mailbox = f' in {self.mailbox!r}' if self.mailbox is not None else ''
+        with OperationStatus(f'{self.label}: {operation}{mailbox}'):
+            return self._read(operation, func)
+
+    def _read(self, operation, func):
         for attempt in range(self.retries + 1):
             check_stop()
             try:
@@ -1056,7 +1061,7 @@ class Session:
     def select(self, mailbox):
         # Forget the previous mailbox before reconnecting to a different one.
         self.mailbox, self.validity = None, None
-        self.read('EXAMINE', lambda c: self._select(mailbox))
+        self.read(f'EXAMINE {mailbox!r}', lambda c: self._select(mailbox))
         return self.validity
 
     def folders(self):
@@ -1084,7 +1089,9 @@ class Session:
         records = {}
         for start in range(0, len(ids), 500):
             chunk = ids[start:start+500]
-            records.update(self.fetch(chunk, False))
+            with OperationStatus(f'{self.label}: reading metadata '
+                    f'{start+1}-{start+len(chunk)}/{len(ids)} in {self.mailbox!r}'):
+                records.update(self.fetch(chunk, False))
         if set(records) != set(ids):
             raise RuntimeError(f'{self.label}: mailbox changed during snapshot')
         return records
@@ -1100,6 +1107,11 @@ class Session:
         return self.read('UID FETCH', run)
 
     def append(self, mailbox, rec):
+        with OperationStatus(f'{self.label}: APPEND to {mailbox!r} (source UID {rec["uid"]})',
+                             report_completion=False):
+            return self._append(mailbox, rec)
+
+    def _append(self, mailbox, rec):
         # Consume any stale APPENDUID before this command.
         self.c.response('APPENDUID')
         self.c.literal = rec['raw']
@@ -1679,6 +1691,62 @@ class Progress:
             f'copy elapsed={human_duration(elapsed)}']
 
 
+OPERATION_STATE = threading.local()
+
+
+class OperationStatus(Progress):
+    """Display-only timer: never accesses a connection or changes retry behavior."""
+    def __init__(self, description, report_completion=True):
+        super().__init__(1)
+        self.folder_total = 1
+        self.description = description
+        self.report_completion = report_completion
+        self.finished = threading.Event()
+        self.thread = None
+        self.shown = False
+        self.enabled = False
+
+    def __enter__(self):
+        # Prefetch already has its own consumer progress. Nested reads belong
+        # to the outer operation, so only one timer can redraw the terminal.
+        self.enabled = (threading.current_thread() is threading.main_thread()
+                        and not getattr(OPERATION_STATE, 'active', False))
+        if self.enabled:
+            OPERATION_STATE.active = True
+            self.thread = threading.Thread(target=self.run, daemon=True)
+            try:
+                self.thread.start()
+            except BaseException:
+                OPERATION_STATE.active = False
+                raise
+        return self
+
+    def run(self):
+        # Fast operations need no extra output. Event.wait permits instant exit.
+        if self.finished.wait(2):
+            return
+        while not self.finished.is_set():
+            self.shown = True
+            self.show()
+            if self.finished.wait(.5):
+                return
+
+    def progress_lines(self, elapsed):
+        live = sys.stdout.isatty() and os.environ.get('TERM') != 'dumb'
+        frame = '-\\|/'[int(elapsed*2) % 4]+' ' if live else ''
+        return [f'  {frame}Waiting: {self.description} | operation elapsed={elapsed:.2f}s']
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.enabled:
+            self.finished.set()
+            self.thread.join()
+            OPERATION_STATE.active = False
+            if self.shown and self.report_completion:
+                result = 'completed' if exc_type is None else 'stopped'
+                log(f'  {self.description}: {result} '
+                    f'({time.monotonic()-self.start:.2f}s)')
+
+
 class HashProgress(Progress):
     """Folder inventory progress, separate from copied-message counters."""
     def __init__(self, total, cached, label):
@@ -1886,7 +1954,7 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
                   f'changed-or-uncertain={len(failures)-equivalent_count}. '
                   'Continuing transfer; original bytes remain different.')
     if todo:
-        with Prefetch(src, source, todo, opts) as stream:
+        with Prefetch(src, source, todo, opts, on_wait=progress.show) as stream:
             for rec in stream:
                 check_stop()
                 uid = rec['uid']
