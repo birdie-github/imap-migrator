@@ -1732,8 +1732,7 @@ class CopyProgress(Progress):
         self.skipped += mapped
         self.show_stats = total > mapped
         if not self.show_stats:
-            log(self.row(self.folder_name, total, 0, 0)+
-                ' — nothing to upload; verification follows.')
+            log('  Nothing to upload; verification follows.')
             return
         self.copy_started = time.monotonic()
         self.show(True)
