@@ -976,20 +976,22 @@ def content_summary(raw):
         return None
 
 
-def show_content_difference(source_summary, raw):
+def show_content_difference(source_summary, raw, *, file_only=False, label='First changed message'):
     target = content_summary(raw)
     if source_summary is None or target is None:
-        log('  Diagnostic: MIME comparison unavailable; inspect an original/returned message pair.')
+        log('  Diagnostic: MIME comparison unavailable; inspect an original/returned message pair.',
+            file_only=file_only)
         return
     sh, dh = source_summary['headers'], target['headers']
     added = sorted(set(dh)-set(sh))
     removed = sorted(set(sh)-set(dh))
     changed = sorted(name for name in sh.keys() & dh.keys() if sh[name] != dh[name])
-    log('  First changed message: header fields added=' + repr(added) +
-          ' removed=' + repr(removed) + ' changed=' + repr(changed))
+    log('  '+label+': header fields added=' + repr(added) +
+          ' removed=' + repr(removed) + ' changed=' + repr(changed), file_only=file_only)
     equal = source_summary['mime'] == target['mime']
     log('  Decoded MIME payload/structure: ' + ('MATCH' if equal else 'DIFFERENT') +
-          ' (diagnostic only; exact content verification still reports the difference).')
+          ' (diagnostic only; exact content verification still reports the difference).',
+          file_only=file_only)
 
 
 class AppendRejected(RuntimeError):
@@ -2161,7 +2163,54 @@ def repair_matches(source, target):
             and source['flags'] == target['flags'] and source['epoch'] == target['epoch'])
 
 
-def finish_repair(src, dst, journal, task):
+def repair_content_description(source, target):
+    if source['strict'] == target['strict']:
+        return 'byte-identical'
+    if source['canon'] == target['canon']:
+        return 'identical except for line endings (original bytes differ)'
+    if equivalent(source, target):
+        return 'equivalent under checked rules (original bytes differ)'
+    return 'changed or uncertain'
+
+
+def show_repair_difference(src, task, source, target, diagnostic_state):
+    count = diagnostic_state[0] if diagnostic_state is not None else 0
+    file_only = count >= MESSAGE_DIAGNOSTIC_LIMIT
+    if diagnostic_state is not None:
+        diagnostic_state[0] += 1
+    if file_only and count == MESSAGE_DIAGNOSTIC_LIMIT:
+        log(f'  Further detailed repair diagnostics suppressed on terminal '
+            f'(limit {MESSAGE_DIAGNOSTIC_LIMIT} per folder); '
+            'use --log-file for every failed candidate. Failure summaries remain visible.')
+    if file_only and LOG_FILE is None:
+        return
+    show_message_identity(src, task['sf'], task['sv'], task['su'], task['df'],
+        task['dv'], task['new_du'], 'Repair candidate difference',
+        message_log_headers(source['raw']), file_only=file_only)
+    if source['flags'] != target['flags']:
+        log(f'    Flags: source={source["flags"]!r}; candidate={target["flags"]!r}',
+            file_only=file_only)
+    if source['epoch'] != target['epoch']:
+        log(f'    INTERNALDATE: source={source["date"]!r} (epoch {source["epoch"]}); '
+            f'candidate={target["date"]!r} (epoch {target["epoch"]})', file_only=file_only)
+    if source['strict'] != target['strict']:
+        log(f'    Message size: source={len(source["raw"]):,} bytes; '
+            f'candidate={len(target["raw"]):,} bytes', file_only=file_only)
+        if source['canon'] == target['canon']:
+            def endings(raw):
+                crlf = raw.count(b'\r\n')
+                lf, cr = raw.count(b'\n')-crlf, raw.count(b'\r')-crlf
+                return f'CRLF={crlf:,}, bare LF={lf:,}, bare CR={cr:,}'
+            log('    Line endings: source '+endings(source['raw'])+
+                '; candidate '+endings(target['raw']), file_only=file_only)
+            log('    Entire message matches after line-ending normalization; '
+                'this is not byte-exact verification or signature validation.', file_only=file_only)
+        else:
+            show_content_difference(content_summary(source['raw']), target['raw'],
+                file_only=file_only, label='Repair candidate')
+
+
+def finish_repair(src, dst, journal, task, diagnostic_state=None):
     """Resume a candidate or committed cleanup without issuing another APPEND."""
     sf, sv, su, df, dv = (task[key] for key in ('sf','sv','su','df','dv'))
     if src.select(sf) != sv or dst.select(df) != dv:
@@ -2182,8 +2231,12 @@ def finish_repair(src, dst, journal, task):
     journal.save('destination', df, dv, target)
     if not repair_matches(source, target):
         log(f'  REPAIR FAILED: {sf!r} source UID {su}, candidate UID {du}. '
+              f'Content: {repair_content_description(source, target)}; '
+              f'flags={"MATCH" if source["flags"] == target["flags"] else "DIFFER"}; '
+              f'INTERNALDATE={"MATCH" if source["epoch"] == target["epoch"] else "DIFFER"}. '
               'Replacement failed content/flags/date verification; retained old and candidate copies. '
               'Reruns recheck this candidate without appending duplicates.', flush=True)
+        show_repair_difference(src, task, source, target, diagnostic_state)
         return False
     old = task.get('old_du')
     if old is not None and old in destination:
@@ -2204,12 +2257,13 @@ def finish_repair(src, dst, journal, task):
 
 def repair_folder(src, dst, journal, folder, df, delim, opts):
     ensure_folder(dst, df, delim)
+    diagnostic_state = [0]
     # Resume outstanding candidates/cleanup first; never append a second candidate.
     for task in journal.repair_rows():
         if task['sf'] == folder.name:
             if task['df'] != df:
                 raise RuntimeError('Repair destination differs from current folder mapping')
-            finish_repair(src, dst, journal, task)
+            finish_repair(src, dst, journal, task, diagnostic_state)
     sv, source = inventory(src, journal, 'source', folder.name, opts, full=True)
     dv, destination = inventory(dst, journal, 'destination', df, opts, full=True)
     bound = journal.bindings(folder.name, sv, df, dv)
@@ -2273,7 +2327,7 @@ def repair_folder(src, dst, journal, folder, df, delim, opts):
                 reconcile(dst, journal, opts)
         task = next(task for task in journal.repair_rows()
                     if (task['sf'],task['sv'],task['su']) == (folder.name,sv,su))
-        finish_repair(src, dst, journal, task)
+        finish_repair(src, dst, journal, task, diagnostic_state)
         # Refresh live metadata without discarding the content fingerprints.
         live = dst.snapshot()
         if set(live) - set(destination) - {task['new_du']}:
