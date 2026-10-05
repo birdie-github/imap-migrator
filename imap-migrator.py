@@ -1637,7 +1637,7 @@ class Progress:
         self.start, self.last = time.monotonic(), 0
         self.log_last = 0
 
-    def begin_folder(self, total, mapped, destination_count):
+    def begin_folder(self, total, mapped, destination_count, name='Folder'):
         self.folder_total, self.folder_done = total, mapped
         self.folder_copied, self.folder_mapped = 0, mapped
         self.done += mapped
@@ -1656,6 +1656,12 @@ class Progress:
         self.folder_done += 1
         self.uploaded += size
 
+    def end_folder(self):
+        pass
+
+    def elapsed_seconds(self, now):
+        return now-self.start
+
     def show(self, force=False):
         global _progress_rows, _progress_columns
         if self.folder_total == 0:
@@ -1664,7 +1670,7 @@ class Progress:
         live = sys.stdout.isatty() and os.environ.get('TERM') != 'dumb'
         if not force and now-self.last < (.25 if live else 10):
             return
-        elapsed = max(now-self.start, .001)
+        elapsed = max(self.elapsed_seconds(now), .001)
         lines = self.progress_lines(elapsed)
         with OUTPUT_LOCK:
             if LOG_FILE is not None and (force or now-self.log_last >= 10):
@@ -1689,6 +1695,71 @@ class Progress:
             f'  Speed: {self.copied/elapsed:.1f} copied msg/s | uploaded={human_bytes(self.uploaded)} '
             f'({human_bytes(int(self.uploaded/elapsed))}/s) | fetched={human_bytes(self.downloaded)} | '
             f'copy elapsed={human_duration(elapsed)}']
+
+
+def terminal_text_width(text):
+    return sum(0 if unicodedata.combining(char) else
+               2 if unicodedata.east_asian_width(char) in ('W', 'F') else 1
+               for char in text)
+
+
+class CopyProgress(Progress):
+    """Compact copy-only counters; widths are chosen from the source census."""
+    def __init__(self, total, folder_counts):
+        super().__init__(total)
+        self.names = {name: ''.join(char if char.isprintable() else repr(char)[1:-1]
+                                   for char in name) for name in folder_counts}
+        self.name_width = max([terminal_text_width('Total')] +
+                              [terminal_text_width(name) for name in self.names.values()])
+        self.number_width = max(len(f'{total:,}'),
+                                max((len(f'{count:,}') for count in folder_counts.values()), default=1))
+        self.folder_name = ''
+        self.copy_seconds = 0.0
+        self.copy_started = None
+        self.show_stats = False
+
+    def row(self, name, total, copied, left):
+        padding = ' ' * max(0, self.name_width-terminal_text_width(name))
+        count = f'({total:,})'
+        return (f'{name}{padding} {count:>{self.number_width+2}}: '
+                f'{copied:>{self.number_width},} | {left:>{self.number_width},} left')
+
+    def begin_folder(self, total, mapped, destination_count, name='Folder'):
+        self.folder_name = self.names.get(name, name)
+        self.folder_total, self.folder_done = total, mapped
+        self.folder_copied, self.folder_mapped = 0, mapped
+        self.done += mapped
+        self.skipped += mapped
+        self.show_stats = total > mapped
+        if not self.show_stats:
+            log(self.row(self.folder_name, total, 0, 0)+
+                ' — nothing to upload; verification follows.')
+            return
+        self.copy_started = time.monotonic()
+        self.show(True)
+
+    def end_folder(self):
+        if self.copy_started is not None:
+            self.copy_seconds += time.monotonic()-self.copy_started
+            self.copy_started = None
+
+    def elapsed_seconds(self, now):
+        return self.copy_seconds + (now-self.copy_started if self.copy_started is not None else 0)
+
+    def show(self, force=False):
+        if self.show_stats:
+            super().show(force)
+
+    def progress_lines(self, elapsed):
+        return [
+            self.row(self.folder_name, self.folder_total, self.folder_copied,
+                     max(0, self.folder_total-self.folder_done)),
+            self.row('Total', self.total, self.copied, max(0, self.total-self.done)),
+            '',
+            f'Transferred: {human_bytes(self.uploaded)} ↑ | {human_bytes(self.downloaded)} ↓',
+            f'Speed:       {self.copied/elapsed:.1f} msg/s | '
+            f'{human_bytes(int(self.uploaded/elapsed))}/s ↑',
+            f'Copy time:   {human_duration(elapsed) if elapsed >= 1 else f"{elapsed:.2f}s"}']
 
 
 OPERATION_STATE = threading.local()
@@ -1908,7 +1979,7 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
             j.bind(f.name, sv, su, df, dv, du)
             bound[su] = du
     todo = [uid for uid in sorted(source) if uid not in bound]
-    progress.begin_folder(len(source), len(bound), len(dest))
+    progress.begin_folder(len(source), len(bound), len(dest), name=f.name)
     waiting = {}
     waiting_bytes = 0
     rewritten = 0
@@ -1999,6 +2070,7 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
                 progress.copied_message(len(rec['raw']))
                 progress.show()
         check_uploaded()
+    progress.end_folder()
     progress.show(True)
     log()
     # The consumer may have spent minutes uploading the final source batch.
@@ -2844,12 +2916,14 @@ def main(argv=None):
                 raise RuntimeError('Outstanding repair falls outside current migration folder mappings')
             log('Counting source messages...', flush=True)
             total = 0
+            folder_counts = {}
             for n, f in enumerate(folders, 1):
                 log(f'  Counting [{n}/{len(folders)}] {f.name!r}', flush=True)
                 src.select(f.name)
-                total += len(src.snapshot())
-            log(f'Source: {total} messages in {len(folders)} folders. Destination root: {root!r}')
-            progress = Progress(total)
+                folder_counts[f.name] = len(src.snapshot())
+                total += folder_counts[f.name]
+            log(f'Source: {total:,} messages in {len(folders):,} folders. Destination root: {root!r}')
+            progress = CopyProgress(total, folder_counts)
             for n,f in enumerate(folders,1):
                 log(f'\n[{n}/{len(folders)}] {f.name!r} -> {names[f.name]!r}', flush=True)
                 if args.repair:
