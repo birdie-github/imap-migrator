@@ -2119,50 +2119,56 @@ def verify_folder(src, dst, j, f, df, opts):
                    r['strict'] if strict else r['canon'] for r in records.values())
     bound = j.bindings(f.name, sv, df, dv)
     mapped = {su:du for su,du in bound.items() if su in source and du in dest}
-    changed = 0
-    equivalent_count = 0
-    if len(mapped) == len(source):
-        # Server-confirmed UID bindings distinguish transformed mail from absent mail.
-        strict = sum(source[su]['strict'] == dest[du]['strict'] for su,du in mapped.items())
-        changed = len(source) - strict
-        equivalent_count = sum(source[su]['strict'] != dest[du]['strict'] and
-            equivalent(source[su], dest[du]) for su,du in mapped.items())
-        missing = 0
-        extra = len(set(dest)-set(mapped.values()))
-        meta = sum((source[su]['flags'],source[su]['epoch']) !=
-                   (dest[du]['flags'],dest[du]['epoch']) for su,du in mapped.items())
-    else:
-        s,d = counter(source),counter(dest)
-        sm,dm = counter(source,True),counter(dest,True)
-        strict = sum((counter(source,strict=True) & counter(dest,strict=True)).values())
-        missing,extra = sum((s-d).values()),sum((d-s).values())
-        meta = sum((sm-dm).values()) + sum((dm-sm).values())
-        changed = max(0, len(source)-strict-missing)
+    # Count confirmed pairs first; unmatched messages must not override known
+    # equivalence or let a duplicate's hash hide a changed mapped message.
+    strict = sum(source[su]['strict'] == dest[du]['strict'] for su, du in mapped.items())
+    changed = len(mapped) - strict
+    equivalent_count = sum(source[su]['strict'] != dest[du]['strict'] and
+        equivalent(source[su], dest[du]) for su, du in mapped.items())
+    meta = sum((source[su]['flags'], source[su]['epoch']) !=
+               (dest[du]['flags'], dest[du]['epoch']) for su, du in mapped.items())
+    unmatched_source = {su: rec for su, rec in source.items() if su not in mapped}
+    mapped_dest = set(mapped.values())
+    unmatched_dest = {du: rec for du, rec in dest.items() if du not in mapped_dest}
+    sc, dc = counter(unmatched_source), counter(unmatched_dest)
+    sm, dm = counter(unmatched_source, True), counter(unmatched_dest, True)
+    unmatched_strict = sum((counter(unmatched_source, strict=True) &
+                            counter(unmatched_dest, strict=True)).values())
+    missing, extra = sum((sc-dc).values()), sum((dc-sc).values())
+    strict += unmatched_strict
+    changed += max(0, len(unmatched_source)-unmatched_strict-missing)
+    # Count metadata differences only among content-matched unmatched copies;
+    # absent or extra mail is already represented by missing/extra counts.
+    meta += sum((sc & dc).values()) - sum((sm & dm).values())
     # Report every known mismatching pair, even when other bindings are missing.
     # Never infer a pairing from a Message-ID or an unmatched content count.
     different_pairs = {}
     for su, du in sorted(mapped.items()):
         differences = []
         if source[su]['strict'] != dest[du]['strict']:
-            differences.append('bytes (checked-equivalent)' if equivalent(source[su], dest[du])
-                               else 'bytes (changed or uncertain)')
+            differences.append('bytes ('+repair_content_description(source[su], dest[du])+')')
         if source[su]['flags'] != dest[du]['flags']:
             differences.append('flags')
         if source[su]['epoch'] != dest[du]['epoch']:
             differences.append('INTERNALDATE')
         if differences:
             different_pairs[su] = (du, differences)
-    # Cap terminal output; a requested log receives every differing pair.
-    # Fetch only headers, not another copy of every changed message body.
+    # Body diagnostics share the repair reporter. Bound each read batch and
+    # only fetch pairs that will be displayed or written to the requested log.
     terminal_uids = set(sorted(different_pairs)[:MESSAGE_DIAGNOSTIC_LIMIT])
     diagnostic_uids = sorted(different_pairs) if LOG_FILE is not None else sorted(terminal_uids)
     for ids in batches(source, diagnostic_uids, opts.batch_messages, opts.batch_bytes):
-        diagnostics = src.fetch_headers(ids)
+        originals = src.fetch(ids)
+        returned = dst.fetch([different_pairs[su][0] for su in ids])
         for su in ids:
             du, differences = different_pairs[su]
-            show_message_identity(src, f.name, sv, su, df, dv, du,
-                'Verification difference: '+', '.join(differences),
-                message_log_headers(diagnostics[su]), file_only=su not in terminal_uids)
+            original, target = originals[su], returned[du]
+            for fresh, recorded in ((original, source[su]), (target, dest[du])):
+                if any(fresh[key] != recorded[key] for key in ('strict', 'flags', 'epoch')):
+                    raise RuntimeError('Message changed during verification diagnostics; rerun verification')
+            show_pair_difference(src, f.name, sv, su, df, dv, du, original, target,
+                reason='Verification difference: '+', '.join(differences),
+                file_only=su not in terminal_uids)
     if len(different_pairs) > len(terminal_uids):
         log(f'  {df!r}: terminal details shown for {len(terminal_uids)}/{len(different_pairs)} '
             f'differing mapped messages; {len(different_pairs)-len(terminal_uids)} suppressed on terminal. '
@@ -2213,30 +2219,41 @@ def show_repair_difference(src, task, source, target, diagnostic_state):
             'use --log-file for every failed candidate. Failure summaries remain visible.')
     if file_only and LOG_FILE is None:
         return
-    show_message_identity(src, task['sf'], task['sv'], task['su'], task['df'],
-        task['dv'], task['new_du'], 'Repair candidate difference',
+    show_pair_difference(src, task['sf'], task['sv'], task['su'], task['df'],
+        task['dv'], task['new_du'], source, target,
+        reason='Repair candidate difference', file_only=file_only)
+
+
+def show_pair_difference(src, sf, sv, su, df, dv, du, source, target, *,
+                         reason, file_only=False):
+    """One detailed diagnostic format for verification and repair."""
+    show_message_identity(src, sf, sv, su, df, dv, du, reason,
         message_log_headers(source['raw']), file_only=file_only)
-    if source['flags'] != target['flags']:
-        log(f'    Flags: source={source["flags"]!r}; candidate={target["flags"]!r}',
-            file_only=file_only)
-    if source['epoch'] != target['epoch']:
-        log(f'    INTERNALDATE: source={source["date"]!r} (epoch {source["epoch"]}); '
-            f'candidate={target["date"]!r} (epoch {target["epoch"]})', file_only=file_only)
+    log('    Content: '+repair_content_description(source, target), file_only=file_only)
+    log(f'    SHA-256: source={source["strict"]}; destination={target["strict"]}',
+        file_only=file_only)
+    log(f'    Line-ending-normalized SHA-256: source={source["canon"]}; '
+        f'destination={target["canon"]}', file_only=file_only)
+    log(f'    Message size: source={len(source["raw"]):,} bytes; '
+        f'destination={len(target["raw"]):,} bytes', file_only=file_only)
+    log('    Flags: '+('MATCH' if source['flags'] == target['flags'] else 'DIFFER')+
+        f'; source={source["flags"]!r}; destination={target["flags"]!r}', file_only=file_only)
+    log('    INTERNALDATE: '+('MATCH' if source['epoch'] == target['epoch'] else 'DIFFER')+
+        f'; source={source["date"]!r} (epoch {source["epoch"]}); '
+        f'destination={target["date"]!r} (epoch {target["epoch"]})', file_only=file_only)
     if source['strict'] != target['strict']:
-        log(f'    Message size: source={len(source["raw"]):,} bytes; '
-            f'candidate={len(target["raw"]):,} bytes', file_only=file_only)
+        def endings(raw):
+            crlf = raw.count(b'\r\n')
+            lf, cr = raw.count(b'\n')-crlf, raw.count(b'\r')-crlf
+            return f'CRLF={crlf:,}, bare LF={lf:,}, bare CR={cr:,}'
+        log('    Line endings: source '+endings(source['raw'])+
+            '; destination '+endings(target['raw']), file_only=file_only)
         if source['canon'] == target['canon']:
-            def endings(raw):
-                crlf = raw.count(b'\r\n')
-                lf, cr = raw.count(b'\n')-crlf, raw.count(b'\r')-crlf
-                return f'CRLF={crlf:,}, bare LF={lf:,}, bare CR={cr:,}'
-            log('    Line endings: source '+endings(source['raw'])+
-                '; candidate '+endings(target['raw']), file_only=file_only)
             log('    Entire message matches after line-ending normalization; '
                 'this is not byte-exact verification or signature validation.', file_only=file_only)
         else:
             show_content_difference(content_summary(source['raw']), target['raw'],
-                file_only=file_only, label='Repair candidate')
+                file_only=file_only, label='Message difference')
 
 
 def finish_repair(src, dst, journal, task, diagnostic_state=None):
