@@ -91,10 +91,13 @@ def elapsed_stamp():
     return f'[{hours:02d}:{minutes:02d}:{seconds:02d}.{hundredths:02d}]'
 
 
-def log(*args, sep=' ', end='\n', file=None, flush=True, file_only=False):
+def log(*args, sep=' ', end='\n', file=None, flush=True, file_only=False,
+        to_log=True, log_text=None):
     global _progress_rows, LOG_FILE
     stream = sys.stdout if file is None else file
     text = sep.join(str(arg) for arg in args)
+    # Diagnostic file output is plain and independent of terminal timestamps.
+    file_text = text if log_text is None else log_text
     with OUTPUT_LOCK:
         # A normal message freezes the last progress block, preventing subsequent
         # terminal redraws from erasing diagnostics (including worker messages).
@@ -104,9 +107,9 @@ def log(*args, sep=' ', end='\n', file=None, flush=True, file_only=False):
         text = '\n'.join(stamp+' '+line if line else '' for line in text.split('\n'))
         if not file_only:
             builtins.print(text, end=end, file=stream, flush=flush)
-        if LOG_FILE is not None:
+        if to_log and LOG_FILE is not None:
             try:
-                builtins.print(text, end=end, file=LOG_FILE, flush=True)
+                builtins.print(file_text, end=end, file=LOG_FILE, flush=True)
             except OSError as exc:
                 failed_log, LOG_FILE = LOG_FILE, None
                 with contextlib.suppress(OSError):
@@ -599,7 +602,8 @@ def oauth_access_token_from_refresh(refresh_token: str, provider: str,
                 or "Unspecified OAuth error"
             )
         )
-    log(f'  {provider} access token received ({time.monotonic()-refresh_started:.2f}s)')
+    log(f'  {provider} access token received ({time.monotonic()-refresh_started:.2f}s)',
+        log_text=f'  {provider} access token received')
     return token
 
 
@@ -1044,7 +1048,8 @@ class Session:
                 if attempt == self.retries:
                     raise RuntimeError(f'{self.label}: {operation} failed after retries: {exc}') from exc
                 delay = min(2**attempt, 8)
-                log(f'\n{self.label}: {operation}: {exc}; reconnecting in {delay}s', file=sys.stderr)
+                log(f'\n{self.label}: {operation}: {exc}; reconnecting in {delay}s', file=sys.stderr,
+                    log_text=f'\n{self.label}: {operation}: {exc}; reconnecting (retry {attempt+1})')
                 for _ in range(delay*10):
                     check_stop()
                     time.sleep(.1)
@@ -1619,7 +1624,8 @@ def prepare_destination_tree(dst, names, delim, source=None, known_folders=None)
             log(f'  Returning to read-only EXAMINE: {df!r}', flush=True)
             dst.select(df)
             log(f'  Ready [{n}/{len(ordered)}]: {df!r} '
-                f'({time.monotonic()-folder_started:.2f}s)', flush=True)
+                f'({time.monotonic()-folder_started:.2f}s)', flush=True,
+                log_text=f'  Ready [{n}/{len(ordered)}]: {df!r}')
         except (RuntimeError, imaplib.IMAP4.error, OSError) as exc:
             raise RuntimeError(f'Destination tree preparation failed: {sf!r} -> {df!r}: {exc}. '
                 'No messages were uploaded/deleted in this run. Successfully created folders '
@@ -1644,7 +1650,8 @@ def prepare_destination_tree(dst, names, delim, source=None, known_folders=None)
                   'Subscribe manually in your mail client if it is hidden.', file=sys.stderr)
     keep_source_alive()
     log(f'Destination tree ready ({time.monotonic()-started:.2f}s); '
-        'beginning migration/recovery.', flush=True)
+        'beginning migration/recovery.', flush=True,
+        log_text='Destination tree ready; beginning migration/recovery.')
 
 
 class Progress:
@@ -1653,7 +1660,6 @@ class Progress:
         self.folder_total = self.folder_done = self.folder_copied = self.folder_mapped = 0
         self.uploaded, self.downloaded = 0, 0
         self.start, self.last = time.monotonic(), 0
-        self.log_last = 0
 
     def begin_folder(self, total, mapped, destination_count, name='Folder'):
         self.folder_total, self.folder_done = total, mapped
@@ -1691,9 +1697,6 @@ class Progress:
         elapsed = max(self.elapsed_seconds(now), .001)
         lines = self.progress_lines(elapsed)
         with OUTPUT_LOCK:
-            if LOG_FILE is not None and (force or now-self.log_last >= 10):
-                log('\n'.join(lines), file_only=True)
-                self.log_last = now
             columns = shutil.get_terminal_size().columns
             if live and _progress_rows and columns == _progress_columns:
                 sys.stdout.write(f'\x1b[{_progress_rows}A\r\x1b[J')
@@ -1832,7 +1835,7 @@ class OperationStatus(Progress):
             if self.shown and self.report_completion:
                 result = 'completed' if exc_type is None else 'stopped'
                 log(f'  {self.description}: {result} '
-                    f'({time.monotonic()-self.start:.2f}s)')
+                    f'({time.monotonic()-self.start:.2f}s)', to_log=False)
 
 
 class HashProgress(Progress):
@@ -2027,7 +2030,8 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
                             file_only=diagnostic_count >= MESSAGE_DIAGNOSTIC_LIMIT)
                 if diagnostic_count >= MESSAGE_DIAGNOSTIC_LIMIT and not diagnostic_suppressed:
                     log(f'  Further changed-message details suppressed for {df!r} '
-                        f'(limit {MESSAGE_DIAGNOSTIC_LIMIT}); counts and journal mappings are retained.')
+                        f'(limit {MESSAGE_DIAGNOSTIC_LIMIT}); counts and journal mappings are retained.',
+                        to_log=False)
                     diagnostic_suppressed = True
                 diagnostic_count += 1
                 if not diagnosed and summary is not None:
@@ -2153,7 +2157,7 @@ def verify_folder(src, dst, j, f, df, opts):
     if len(different_pairs) > len(terminal_uids):
         log(f'  {df!r}: terminal details shown for {len(terminal_uids)}/{len(different_pairs)} '
             f'differing mapped messages; {len(different_pairs)-len(terminal_uids)} suppressed on terminal. '
-            'All differences are counted; all UID mappings remain in the journal.')
+            'All differences are counted; all UID mappings remain in the journal.', to_log=False)
     # Detect changes throughout body scans, including concurrent deletions/arrivals.
     def stable(s, recs):
         snap = s.snapshot()
@@ -2197,7 +2201,7 @@ def show_repair_difference(src, task, source, target, diagnostic_state):
     if file_only and count == MESSAGE_DIAGNOSTIC_LIMIT:
         log(f'  Further detailed repair diagnostics suppressed on terminal '
             f'(limit {MESSAGE_DIAGNOSTIC_LIMIT} per folder); '
-            'use --log-file for every failed candidate. Failure summaries remain visible.')
+            'use --log-file for every failed candidate. Failure summaries remain visible.', to_log=False)
     if file_only and LOG_FILE is None:
         return
     show_message_identity(src, task['sf'], task['sv'], task['su'], task['df'],
@@ -2956,7 +2960,8 @@ def main(argv=None):
                 raise RuntimeError('Log file must differ from configuration and journal')
             descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
             LOG_FILE = os.fdopen(descriptor, 'a', encoding='utf-8')
-            log('\nRun started at '+_dt.datetime.now(_dt.timezone.utc).isoformat())
+            log('\nRun started at '+_dt.datetime.now(_dt.timezone.utc).isoformat(),
+                log_text='\n=== New run ===')
             log(f'Log file: {str(log_path)!r}; includes message Subjects and Dates.')
         if args.export_archive or args.import_archive:
             archive_root = args.path.expanduser().resolve()
