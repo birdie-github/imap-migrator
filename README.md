@@ -1,4 +1,52 @@
-# IMAP migrator
+# IMAP Migrator — Email Migration, Backup & Restore
+
+**Unshackle yourself from your email provider. Take your mailbox with you.**
+
+IMAP Migrator is a free, open-source Python command-line tool for copying email between IMAP accounts, creating incremental local EML backups, and restoring archived messages to an IMAP server. Migrate your email history, keep a local archive, or switch providers without deleting your source messages. Resumable transfers, Thunderbird OAuth for Gmail and Outlook, and independent byte-exact verification help you check what actually arrived.
+
+## Your email history should survive your next provider change
+
+- **Transfer email between accounts:** copy messages and map the source folder hierarchy into a dedicated destination root. Folder names and nesting must be compatible with the destination server.
+- **Back up your mailbox to EML files:** export individual messages with their original fetched bytes, plus JSON `.metadata` files recording folders, timestamps, flags, and SHA-256 hashes.
+- **Refresh an incremental IMAP backup:** rerun export to add new messages, check existing files, and refresh metadata. Previously exported messages removed from the source are retained; import uses the latest completed snapshot.
+- **Restore email from a local archive:** upload exported EML messages to another IMAP account without needing the original provider online.
+- **Migrate using different internet connections:** export on the connection that works well for the source, then import on the connection that works well for the destination.
+- **Resume an interrupted email migration:** keep the SQLite journal and rerun. The script tracks accepted uploads and checks uncertain outcomes before attempting recovery.
+- **Check whether your provider changed your mail:** independently fetch and compare source and destination content, distinguish exact preservation from recognized formatting changes, and report missing or damaged copies.
+
+The source account remains read-only. Normal copying does not delete destination mail either; explicit repair can replace tracked damaged copies after verifying their replacements.
+
+## Gmail, Outlook, Hotmail, Yandex, GMX, and other IMAP accounts
+
+Looking to migrate Gmail to Outlook, transfer Outlook or Hotmail email to another provider, copy Yandex Mail to GMX, or move your mailbox to a self-hosted IMAP server? These are the kinds of account-to-account migrations this tool is designed for, provided both accounts expose compatible IMAP access and authentication.
+
+Password and supplied OAuth access-token authentication are available. For Gmail and Microsoft Outlook/Hotmail, the script can also read an existing Thunderbird OAuth refresh token and request a fresh IMAP access token. Thunderbird must already have the account configured with OAuth2.
+
+Provider rules still apply: folder nesting, quotas, supported flags, and message rewriting differ between servers. The built-in provider notices record observations rather than promising universal compatibility or identical storage behavior. See the verification and provider-notice sections below.
+
+## Common email migration and backup questions
+
+### How do I copy all my email to another account?
+
+Configure the source and destination IMAP accounts and choose a dedicated destination root, then run `python3 imap-migrator.py`. Keep the journal to resume. Use `--verify-only --full-verify` for an independent comparison after copying. The commands and configuration details follow below.
+
+### Can I download my Gmail or Outlook mailbox as EML files?
+
+Yes, when the account permits IMAP access. Use `--export --path /path/to/archive` to create a local email backup. Each message has its own EML file and companion metadata; filenames use UIDs rather than potentially unsafe subject text. Export does not require a destination account.
+
+### Can I import an email backup into a different provider?
+
+Use `--import --path /path/to/archive` with an archive produced by this script. Import restores the latest completed snapshot, verifies local message hashes before connecting, and performs full destination verification. Arbitrary EML collections without the archive metadata are not supported.
+
+### Will my emails, attachments, dates, and read/unread status be preserved?
+
+Export preserves the fetched message bytes, including attachments. Migration and import transfer the original IMAP INTERNALDATE and the portable read, answered, flagged, and draft flags. A destination provider may rewrite message bytes or reject metadata; verification reports those differences. Checked-equivalent formatting is reported separately and still does not pass as byte-identical. The script cannot force a provider to store messages verbatim.
+
+### Is this a mailbox sync tool or a one-way migration tool?
+
+It is a one-way email migration, backup, and restore tool. It does not mirror source deletions or provide continuous two-way synchronization. An ordinary rerun resumes copying and restores missing tracked messages; `--repair` additionally checks and repairs tracked damaged destination copies.
+
+## Requirements
 
 A TLS-only, standard-library Python IMAP migration script. Python 3.10 or newer is required. Thunderbird Microsoft/Google OAuth additionally requires the system NSS library (`libnss3`). Normal migration never deletes mail from either endpoint. Explicit `--repair` can delete specific journaled destination UIDs after verifying replacements; the source is always read-only. The source is opened read-only, and bodies are fetched with `BODY.PEEK[]`.
 
