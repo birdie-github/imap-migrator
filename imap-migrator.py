@@ -48,6 +48,7 @@ import textwrap
 import unicodedata
 import uuid
 import collections
+import csv
 import datetime as _dt
 import hashlib
 import imaplib
@@ -83,6 +84,7 @@ _progress_rows = 0
 _progress_columns = None
 LOG_FILE = None
 PROGRESS_ENABLED = False
+TSV_REPORT = None
 
 
 def elapsed_stamp():
@@ -2148,6 +2150,164 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
         raise RuntimeError(f'{f.name!r}: source changed during migration; rerun for a fresh snapshot')
 
 
+class VerificationReport:
+    """Streaming UTF-8 TSV: every difference/event, without a display limit."""
+    fields = ('phase', 'status', 'content_category', 'match_method',
+        'source_folder', 'source_uidvalidity', 'source_uid',
+        'destination_folder', 'destination_uidvalidity', 'destination_uid',
+        'subject', 'date', 'destination_subject', 'destination_date', 'source_eml',
+        'source_size', 'destination_size', 'source_sha256', 'destination_sha256',
+        'source_normalized_sha256', 'destination_normalized_sha256',
+        'source_flags', 'destination_flags', 'source_internaldate', 'destination_internaldate',
+        'source_epoch', 'destination_epoch', 'flags_match', 'internaldate_match',
+        'headers_added', 'headers_removed', 'headers_changed', 'decoded_mime_match',
+        'source_crlf', 'source_bare_lf', 'source_bare_cr',
+        'destination_crlf', 'destination_bare_lf', 'destination_bare_cr',
+        'old_destination_uid', 'candidate_uids', 'repair_state', 'details')
+
+    def __init__(self, path):
+        self.path = path
+        self.identities = {}
+        descriptor = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        self.file = os.fdopen(descriptor, 'w', encoding='utf-8', newline='')
+        try:
+            if os.name != 'nt':
+                import fcntl
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            existing = os.read(descriptor, 16384)
+            expected = ('\t'.join(self.fields)+'\n').encode('utf-8')
+            if existing and existing.partition(b'\n')[0]+b'\n' != expected:
+                raise RuntimeError('Existing report path is not a report from this version; choose another path')
+            self.file.seek(0)
+            self.file.truncate()
+            self.writer = csv.DictWriter(self.file, self.fields, delimiter='\t', lineterminator='\n')
+            self.writer.writeheader()
+            self.file.flush()
+        except BaseException:
+            self.file.close()
+            raise
+
+    def write(self, **values):
+        def cell(value):
+            if value is None:
+                return ''
+            # Keep one physical line per row, even for arbitrary mail headers.
+            text = str(value).replace('\\', '\\\\').replace('\r', '\\r').replace('\n', '\\n').replace('\t', '\\t')
+            return "'"+text if text.startswith(('=', '+', '-', '@')) else text
+        self.writer.writerow({key: cell(value) for key, value in values.items()})
+        self.file.flush()
+
+    def message(self, src, sf, sv, su, df, dv, du, source=None, target=None,
+                *, phase='verification', status='difference', category='',
+                match_method='journal', source_headers=None, target_headers=None, **extra):
+        row = dict(phase=phase, status=status, content_category=category,
+            match_method=match_method, source_folder=sf, source_uidvalidity=sv, source_uid=su,
+            destination_folder=df, destination_uidvalidity=dv, destination_uid=du)
+        row.update(self.identities.get((sf, sv, su), {}))
+        if isinstance(src, ArchiveSource) and su is not None and sf in src.entries:
+            eml, _ = archive_message_paths(src.root, src.entries[sf], su)
+            row['source_eml'] = str(eml.absolute())
+        for label, rec, headers in (('source', source, source_headers), ('destination', target, target_headers)):
+            if rec is None:
+                continue
+            for field, key in (('size', 'size'), ('sha256', 'strict'),
+                               ('normalized_sha256', 'canon'), ('internaldate', 'date'), ('epoch', 'epoch')):
+                row[label+'_'+field] = rec.get(key, '')
+            row[label+'_flags'] = ' '.join(rec.get('flags', ()))
+            if 'raw' in rec:
+                headers = message_log_headers(rec['raw'])
+                raw = rec['raw']
+                crlf = raw.count(b'\r\n')
+                row[label+'_size'] = len(raw)
+                row[label+'_crlf'] = crlf
+                row[label+'_bare_lf'] = raw.count(b'\n')-crlf
+                row[label+'_bare_cr'] = raw.count(b'\r')-crlf
+            if headers is not None:
+                for header in ('Subject', 'Date'):
+                    key = header.lower() if label == 'source' else 'destination_'+header.lower()
+                    row[key] = ' | '.join(value for name, value in headers if name == header)
+        if source is not None and target is not None:
+            row['flags_match'] = source['flags'] == target['flags']
+            row['internaldate_match'] = source['epoch'] == target['epoch']
+            if 'raw' in source and 'raw' in target and source['canon'] != target['canon']:
+                sh, dh = content_summary(source['raw']), content_summary(target['raw'])
+                if sh is not None and dh is not None:
+                    row['headers_added'] = ', '.join(sorted(set(dh['headers'])-set(sh['headers'])))
+                    row['headers_removed'] = ', '.join(sorted(set(sh['headers'])-set(dh['headers'])))
+                    row['headers_changed'] = ', '.join(sorted(key for key in sh['headers'].keys() & dh['headers'].keys()
+                        if sh['headers'][key] != dh['headers'][key]))
+                    row['decoded_mime_match'] = sh['mime'] == dh['mime']
+        if su is not None:
+            self.identities[(sf, sv, su)] = {key: row[key] for key in ('subject', 'date', 'source_eml') if key in row}
+        row.update(extra)
+        self.write(**row)
+
+    def close(self):
+        self.file.close()
+
+
+def content_category(source, target):
+    if source['strict'] == target['strict']:
+        return 'byte_identical'
+    if source['canon'] == target['canon']:
+        return 'line_endings_only'
+    if 'raw' not in source or 'raw' not in target:
+        return 'other_or_uncertain'
+    sh, dh = content_summary(source['raw']), content_summary(target['raw'])
+    def headers(raw):
+        return raw.replace(b'\r\n', b'\n').replace(b'\r', b'\n').partition(b'\n\n')[0]
+    if (sh is not None and dh is not None and sh['mime'] == dh['mime']
+            and headers(source['raw']) != headers(target['raw'])):
+        return 'headers_only'
+    return 'other_or_uncertain'
+
+
+def report_unmatched(src, dst, sf, sv, df, dv, source, destination, bound, opts, phase='verification'):
+    # Identify unique content correspondences for reporting only. Never adopt a
+    # binding or guess which duplicate corresponds to a source message.
+    remaining_source, remaining_dest = dict(source), dict(destination)
+    pairs = {}
+    for key in ('strict', 'canon'):
+        sg, dg = collections.defaultdict(list), collections.defaultdict(list)
+        for uid, rec in remaining_source.items():
+            sg[rec[key]].append(uid)
+        for uid, rec in remaining_dest.items():
+            dg[rec[key]].append(uid)
+        for fingerprint in sorted(sg.keys() & dg.keys()):
+            if len(sg[fingerprint]) == len(dg[fingerprint]) == 1:
+                su, du = sg[fingerprint][0], dg[fingerprint][0]
+                pairs[su] = (du, remaining_source.pop(su), remaining_dest.pop(du), key)
+    for ids in batches(source, sorted(pairs), opts.batch_messages, opts.batch_bytes):
+        sh = src.fetch_headers(ids)
+        dh = dst.fetch_headers([pairs[su][0] for su in ids])
+        for su in ids:
+            du, original, target, key = pairs[su]
+            TSV_REPORT.message(src, sf, sv, su, df, dv, du, original, target,
+                phase=phase, status='unmapped_content_match', category=content_category(original, target),
+                match_method='unique_'+key, source_headers=message_log_headers(sh[su]),
+                target_headers=message_log_headers(dh[du]),
+                details='Unique content correspondence for reporting only; journal binding was not changed.')
+    for side, records in (('source', remaining_source), ('destination', remaining_dest)):
+        session = src if side == 'source' else dst
+        for ids in batches(records, sorted(records), opts.batch_messages, opts.batch_bytes):
+            headers = session.fetch_headers(ids)
+            for uid in ids:
+                rec = records[uid]
+                if side == 'source':
+                    candidates = [du for du, candidate in remaining_dest.items() if candidate['canon'] == rec['canon']]
+                    TSV_REPORT.message(src, sf, sv, uid, df, dv, bound.get(uid), rec,
+                        phase=phase, status='ambiguous_source' if candidates else 'missing_or_unmatched_source',
+                        match_method='unresolved', source_headers=message_log_headers(headers[uid]),
+                        candidate_uids=', '.join(map(str, sorted(candidates))),
+                        details='No safe pairing; destination UID is the last journal binding, if any.')
+                else:
+                    candidates = [su for su, candidate in remaining_source.items() if candidate['canon'] == rec['canon']]
+                    TSV_REPORT.message(src, sf, sv, None, df, dv, uid, target=rec,
+                        phase=phase, status='ambiguous_destination' if candidates else 'extra_or_unmatched_destination',
+                        match_method='unresolved', target_headers=message_log_headers(headers[uid]),
+                        details='Unpaired destination copy; possible source UIDs: '+', '.join(map(str, sorted(candidates))))
+
+
 def verify_folder(src, dst, j, f, df, opts, totals=None):
     sv, source = inventory(src, j, 'source', f.name, opts, full=opts.full_verify)
     dv, dest = inventory(dst, j, 'destination', df, opts, full=opts.full_verify)
@@ -2208,7 +2368,7 @@ def verify_folder(src, dst, j, f, df, opts, totals=None):
     # All non-normalized content changes need MIME classification for the final
     # totals, even when terminal details are capped and no log was requested.
     terminal_uids = set(sorted(different_pairs)[:MESSAGE_DIAGNOSTIC_LIMIT])
-    diagnostic_uids = set(different_pairs) if LOG_FILE is not None else terminal_uids
+    diagnostic_uids = set(different_pairs) if LOG_FILE is not None or TSV_REPORT is not None else terminal_uids
     classify_uids = {su for su, du in mapped.items()
                      if source[su]['canon'] != dest[du]['canon']}
     for ids in batches(source, sorted(diagnostic_uids | classify_uids),
@@ -2221,20 +2381,23 @@ def verify_folder(src, dst, j, f, df, opts, totals=None):
             for fresh, recorded in ((original, source[su]), (target, dest[du])):
                 if any(fresh[key] != recorded[key] for key in ('strict', 'flags', 'epoch')):
                     raise RuntimeError('Message changed during verification diagnostics; rerun verification')
+            category = content_category(original, target)
             if su in classify_uids:
-                sh, dh = content_summary(original['raw']), content_summary(target['raw'])
-                def normalized_headers(raw):
-                    return raw.replace(b'\r\n', b'\n').replace(b'\r', b'\n').partition(b'\n\n')[0]
-                if (sh is not None and dh is not None and sh['mime'] == dh['mime']
-                        and normalized_headers(original['raw']) != normalized_headers(target['raw'])):
+                if category == 'headers_only':
                     headers_only += 1
                 else:
                     other_content += 1
-            if su in diagnostic_uids:
+            if TSV_REPORT is not None:
+                TSV_REPORT.message(src, f.name, sv, su, df, dv, du, original, target,
+                    category=category, details=', '.join(differences))
+            elif su in diagnostic_uids:
                 show_pair_difference(src, f.name, sv, su, df, dv, du, original, target,
                     reason='Verification difference: '+', '.join(differences),
                     file_only=su not in terminal_uids)
-    if len(different_pairs) > len(terminal_uids):
+    if TSV_REPORT is not None:
+        report_unmatched(src, dst, f.name, sv, df, dv,
+                         unmatched_source, unmatched_dest, bound, opts)
+    elif len(different_pairs) > len(terminal_uids):
         log(f'  {df!r}: terminal details shown for {len(terminal_uids)}/{len(different_pairs)} '
             f'differing mapped messages; {len(different_pairs)-len(terminal_uids)} suppressed on terminal. '
             'All differences are counted; all UID mappings remain in the journal.')
@@ -2405,9 +2568,14 @@ def finish_repair(src, dst, journal, task, diagnostic_state=None, repair_stats=N
             raise RuntimeError('Destination changed while confirming missing repair candidate; record retained')
         journal.save('source', sf, sv, source)
         journal.retire_missing_repair(task, surviving_old)
-        log(f'  Repair candidate UID {du} is confirmed missing in {df!r} (state={state}). '
-            + (f'Old UID {surviving_old} retained; ' if surviving_old is not None else 'No old copy remains; ')
-            + f'source UID {su} will be uploaded again. No destination message deleted.')
+        if TSV_REPORT is not None:
+            TSV_REPORT.message(src, sf, sv, su, df, dv, du, source,
+                phase='repair', status='candidate_missing', old_destination_uid=surviving_old,
+                repair_state=state, details='Missing candidate retired; source will be uploaded again. No deletion.')
+        else:
+            log(f'  Repair candidate UID {du} is confirmed missing in {df!r} (state={state}). '
+                + (f'Old UID {surviving_old} retained; ' if surviving_old is not None else 'No old copy remains; ')
+                + f'source UID {su} will be uploaded again. No destination message deleted.')
         return None
     target = dst.fetch([du])[du]
     journal.save('source', sf, sv, source)
@@ -2415,13 +2583,20 @@ def finish_repair(src, dst, journal, task, diagnostic_state=None, repair_stats=N
     if not repair_matches(source, target):
         if repair_stats is not None:
             repair_stats['failed'] += 1
-        log(f'  REPAIR FAILED: {sf!r} source UID {su}, candidate UID {du}. '
-              f'Content: {repair_content_description(source, target)}; '
-              f'flags={"MATCH" if source["flags"] == target["flags"] else "DIFFER"}; '
-              f'INTERNALDATE={"MATCH" if source["epoch"] == target["epoch"] else "DIFFER"}. '
-              'Replacement failed content/flags/date verification; retained old and candidate copies. '
-              'Reruns recheck this candidate without appending duplicates.', flush=True)
-        show_repair_difference(src, task, source, target, diagnostic_state)
+        if TSV_REPORT is None:
+            log(f'  REPAIR FAILED: {sf!r} source UID {su}, candidate UID {du}. '
+                  f'Content: {repair_content_description(source, target)}; '
+                  f'flags={"MATCH" if source["flags"] == target["flags"] else "DIFFER"}; '
+                  f'INTERNALDATE={"MATCH" if source["epoch"] == target["epoch"] else "DIFFER"}. '
+                  'Replacement failed content/flags/date verification; retained old and candidate copies. '
+                  'Reruns recheck this candidate without appending duplicates.', flush=True)
+        if TSV_REPORT is not None:
+            TSV_REPORT.message(src, sf, sv, su, df, dv, du, source, target,
+                phase='repair', status='candidate_failed', category=content_category(source, target),
+                old_destination_uid=task.get('old_du'), repair_state=task.get('state'),
+                details='Failed replacement retained; no old copy deleted.')
+        else:
+            show_repair_difference(src, task, source, target, diagnostic_state)
         return False
     old = task.get('old_du')
     if old is not None and old in destination:
@@ -2431,14 +2606,23 @@ def finish_repair(src, dst, journal, task, diagnostic_state=None, repair_stats=N
         dst.require_uid_expunge()
     # Commit the new mapping AND cleanup intent before any destructive command.
     # A crash after STORE/EXPUNGE can then only resume this exact UID cleanup.
+    if TSV_REPORT is not None:
+        TSV_REPORT.message(src, sf, sv, su, df, dv, du, source, target,
+            phase='repair', status='replacement_verified', category=content_category(source, target),
+            old_destination_uid=old, details='Passed repair policy; cleanup is next, not yet completed.')
     journal.commit_repair(task)
     if old is not None and old in destination:
         dst.delete_uid(df, dv, old)
     journal.finish_repair(task)
+    if TSV_REPORT is not None:
+        TSV_REPORT.message(src, sf, sv, su, df, dv, du, source, target,
+            phase='repair', status='completed', category=content_category(source, target),
+            old_destination_uid=old, details='Replacement committed and any required old-copy cleanup completed.')
     if repair_stats is not None:
         repair_stats['completed'] += 1
-    log(f'  REPAIRED: {sf!r} source UID {su} -> destination UID {du}' +
-          (f'; removed old UID {old}' if old is not None and old in destination else '; missing message restored'), flush=True)
+    if TSV_REPORT is None:
+        log(f'  REPAIRED: {sf!r} source UID {su} -> destination UID {du}' +
+              (f'; removed old UID {old}' if old is not None and old in destination else '; missing message restored'), flush=True)
     return True
 
 
@@ -2473,6 +2657,10 @@ def repair_folder(src, dst, journal, folder, df, delim, opts, repair_stats=None)
         if matches:
             adopted.append((uid,matches.pop(0)))
     if any(available.values()):
+        if TSV_REPORT is not None:
+            report_unmatched(src, dst, folder.name, sv, df, dv,
+                {su: rec for su, rec in source.items() if su not in bound and su not in staged},
+                {du: destination[du] for du in unknown}, bound, opts, phase='repair_precheck')
         raise RuntimeError(f'{df!r}: untracked destination messages cannot be identified safely. '
                            'Repair will not delete or overwrite untracked messages.')
     for su,du in adopted:
@@ -2492,8 +2680,13 @@ def repair_folder(src, dst, journal, folder, df, delim, opts, repair_stats=None)
         if (rec['strict'],rec['flags'],rec['epoch']) != (expected['strict'],expected['flags'],expected['epoch']):
             raise RuntimeError('Source changed during repair; rerun for a fresh snapshot')
         journal.save('source', folder.name, sv, rec)
-        log(f'  Uploading repair replacement: {folder.name!r} source UID {su} '
-            f'-> {df!r}; {len(rec["raw"]):,} original bytes', flush=True)
+        if TSV_REPORT is not None:
+            TSV_REPORT.message(src, folder.name, sv, su, df, dv, None, rec,
+                phase='repair', status='upload_attempt', old_destination_uid=old,
+                details='Original bytes will be APPENDed; acceptance not yet established.')
+        else:
+            log(f'  Uploading repair replacement: {folder.name!r} source UID {su} '
+                f'-> {df!r}; {len(rec["raw"]):,} original bytes', flush=True)
         if time.monotonic()-dst.last_activity > 30:
             dst.read('pre-repair NOOP', lambda c: require_ok(c.noop(), 'NOOP'))
         task = dict(kind='repair', sf=folder.name, sv=sv, su=su, df=df, dv=dv,
@@ -3038,7 +3231,7 @@ class ArchiveSource:
 
 
 def main(argv=None):
-    global CONFIG_PATH, _stop_requested, RUN_STARTED, _progress_rows, LOG_FILE, PROGRESS_ENABLED
+    global CONFIG_PATH, _stop_requested, RUN_STARTED, _progress_rows, LOG_FILE, PROGRESS_ENABLED, TSV_REPORT
     RUN_STARTED = time.monotonic()
     _progress_rows = 0
     parser = argparse.ArgumentParser(description=__doc__,
@@ -3056,7 +3249,9 @@ def main(argv=None):
     parser.add_argument('--provider-notes', action='store_true', help='Show observed provider preservation behavior and exit')
     parser.add_argument('--config', type=Path, help='INI path (default: beside script)')
     parser.add_argument('--log-file', type=Path,
-        help='Append plain status/results and all changed-message diagnostics to this UTF-8 file; terminal detail limits do not apply')
+        help='Append plain status/results to this UTF-8 file; --report-file receives message details when specified')
+    parser.add_argument('--report-file', type=Path, metavar='PATH',
+        help='Write a UTF-8 TSV difference/repair report (overwritten each run); required with --verify-only or --repair')
     parser.add_argument('--progress', action='store_true',
         help='Show elapsed timestamps, waiting indicators, live counts, transfer rates and copy time on the terminal (off by default)')
     parser.add_argument('--skip-destination-tree-deploy', action='store_true',
@@ -3068,6 +3263,11 @@ def main(argv=None):
     parser.add_argument('--verify-only', action='store_true', help='Verify without creating folders or uploading messages')
     args = parser.parse_args(argv)
     PROGRESS_ENABLED = args.progress
+    TSV_REPORT = None
+    if (args.verify_only or args.repair) and args.report_file is None:
+        parser.error('--report-file PATH is required with --verify-only and --repair')
+    if args.report_file is not None and (args.export_archive or args.provider_notes):
+        parser.error('--report-file cannot be combined with --export or --provider-notes')
     if (args.export_archive or args.import_archive) != (args.path is not None):
         parser.error('--path is required with --export/--import and cannot be used without them')
     if args.export_archive and (args.repair or args.verify_only or args.retry_pending
@@ -3123,6 +3323,17 @@ def main(argv=None):
                 raise RuntimeError('Invalid archive identifier')
             opts.journal = opts.journal.with_name(opts.journal.stem+'-import-'+archive_id[:12]+opts.journal.suffix)
             log('Import uses the completed local snapshot; full byte verification is enabled.')
+        if args.report_file is not None:
+            report_path = args.report_file.expanduser().resolve()
+            protected = {ini_path().resolve(), options(args).journal.resolve(),
+                         opts.journal.resolve(), Path(__file__).resolve()}
+            protected.update(Path(str(path)+suffix) for path in tuple(protected)
+                             for suffix in ('-wal', '-shm', '-journal', '.lock'))
+            if args.log_file:
+                protected.add(args.log_file.expanduser().resolve())
+            if report_path in protected or (args.import_archive and
+                    report_path.is_relative_to(archive_root)):
+                raise RuntimeError('Report must differ from configuration, script, journals, log and archive files')
         if args.repair:
             opts.full_verify = True
         mode = ('verify only; no upload/deletion' if args.verify_only else
@@ -3137,6 +3348,16 @@ def main(argv=None):
         journal = Journal(opts.journal, dict(version=2, source=[source_cfg.server.casefold(), source_cfg.user.casefold()],
             destination=[dest_cfg.server.casefold(),dest_cfg.user.casefold()], root=root,
             **({'archive_id': src.archive['archive_id']} if args.import_archive else {})))
+        if args.report_file is not None:
+            TSV_REPORT = VerificationReport(report_path)
+            log(f'TSV report: {report_path}; message-level findings are written here.')
+        if TSV_REPORT is not None:
+            for task in journal.repair_rows():
+                cached = journal.record('source', task['sf'], task['sv'], task['su'])
+                TSV_REPORT.message(src, task['sf'], task['sv'], task['su'], task['df'],
+                    task['dv'], task['new_du'], cached, phase='repair', status='outstanding_at_start',
+                    old_destination_uid=task.get('old_du'), repair_state=task.get('state'),
+                    details='Repair record present before this run; later rows describe its outcome.')
         log(f'Configuration: {ini_path()}\nJournal: {opts.journal}', flush=True)
         if src is None:
             src = Session(source_cfg,'source',opts.retries)
@@ -3197,21 +3418,41 @@ def main(argv=None):
         final_folders = {f.name for f in src.folders() if r'\noselect' not in f.flags}
         folder_tree_changed = final_folders != {f.name for f in folders}
         ok = ok and not folder_tree_changed
-        outstanding = len(journal.repair_rows())
+        outstanding_tasks = journal.repair_rows()
+        outstanding = len(outstanding_tasks)
+        if TSV_REPORT is not None:
+            for task in outstanding_tasks:
+                cached = journal.record('source', task['sf'], task['sv'], task['su'])
+                TSV_REPORT.message(src, task['sf'], task['sv'], task['su'], task['df'],
+                    task['dv'], task['new_du'], cached, phase='repair', status='outstanding',
+                    old_destination_uid=task.get('old_du'), repair_state=task.get('state'),
+                    details='Outstanding journal record; review candidate and retained old copy.')
         if outstanding:
             ok = False
             log('Outstanding repair candidates remain; no failed replacement was used to delete an old copy.')
         show_verification_totals(verification_totals, full=opts.full_verify,
             repair_stats=repair_stats, outstanding=outstanding,
             folder_tree_changed=folder_tree_changed)
+        if TSV_REPORT is not None:
+            TSV_REPORT.write(phase='run', status='verified' if ok else 'verification_differences',
+                details=json.dumps(dict(totals=dict(verification_totals), full_body_download=opts.full_verify,
+                    repair=dict(repair_stats) if repair_stats is not None else None, outstanding=outstanding),
+                    sort_keys=True))
+            log(f'Detailed TSV report: {TSV_REPORT.path}')
         log('\nFINAL RESULT: '+('VERIFIED' if ok else 'VERIFICATION DIFFERENCES DETECTED (see folder results)'))
         return 0 if ok else 2
     except KeyboardInterrupt:
+        if TSV_REPORT is not None:
+            with contextlib.suppress(OSError):
+                TSV_REPORT.write(phase='run', status='interrupted', details='Partial report; run did not finish.')
         message = ('Stopped. Archive files are retained; rerun --export with the same --path to resume.'
                    if args.export_archive else 'Stopped. Keep the journal and rerun to resume safely.')
         log('\n'+message, file=sys.stderr)
         return 130
     except (RuntimeError, imaplib.IMAP4.error, OSError, ValueError, KeyError, TypeError, sqlite3.Error, configparser.Error) as exc:
+        if TSV_REPORT is not None:
+            with contextlib.suppress(OSError):
+                TSV_REPORT.write(phase='run', status='error', details=str(exc))
         advice = ('Source messages were not deleted. Archive files are retained; interrupted exports '
                   'can resume with --export and the same --path.' if args.export_archive else
                   'Source messages were not deleted. Keep the journal when resuming.')
@@ -3225,6 +3466,10 @@ def main(argv=None):
             with contextlib.suppress(OSError):
                 LOG_FILE.close()
             LOG_FILE = None
+        if TSV_REPORT is not None:
+            with contextlib.suppress(OSError):
+                TSV_REPORT.close()
+            TSV_REPORT = None
         os.umask(previous_umask)
 
 
