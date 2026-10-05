@@ -44,6 +44,7 @@ TB_GOOGLE_IMAP_SCOPE = "https://mail.google.com/"
 import base64
 import builtins
 import shutil
+import textwrap
 import unicodedata
 import uuid
 import collections
@@ -891,56 +892,87 @@ def equivalent(a, b):
 PROVIDER_NOTES = [
     dict(provider='Google Gmail', hosts=('imap.gmail.com', 'imap.googlemail.com'),
          observed='2026-10-05',
-         behavior='Very slow IMAP uploads observed: about 0.25-0.3 copied messages/second '
-                  '(roughly one message every 3-4 seconds). Changing networks did not '
-                  'resolve the reported slowness. Some uploaded messages returned with '
-                  'LF line endings converted to CRLF; original message bytes were not preserved.',
-         scope='User reports across two ISPs and ten VPN locations. Supplied import logs '
-               'show 0.3 copied messages/second and approximately 25 KiB/second. '
-               'Rates measure end-to-end migration work, including verification and other '
-               'processing; they do not isolate APPEND latency or establish a fixed Gmail '
-               'throttling rule. Results may differ by account, message sizes, workload '
-               'and server conditions. User message comparisons and repair diagnostics '
-               'also show line-ending-only changes in a subset of imported messages; '
-               'not every message was rewritten, and reuploading affected originals '
-               'did not reliably restore byte equality. This is an observation, not a '
-               'guarantee about every Gmail account/message. Full verification still '
-               'reports these messages as different bytes.'),
+         behavior=(
+             'Slow uploads: about 0.25-0.3 copied messages/second '
+             '(one message every 3-4 seconds). Changing networks did not resolve this.',
+             'Line endings: some imported messages returned with LF converted to CRLF. '
+             'Original bytes changed; not every message was rewritten.',
+             'Reuploading affected originals did not reliably restore byte equality.'),
+         scope=(
+             'User reports across two ISPs and ten VPN locations. Import logs show '
+             '0.3 copied messages/second and approximately 25 KiB/second. Message '
+             'comparisons and repair diagnostics show line-ending-only changes.',),
+         limits=(
+             'The rate includes migration processing and verification; it does not '
+             'isolate APPEND latency or establish a fixed Gmail throttling rule.',
+             'Results may differ by account, message size, workload and server conditions. '
+             'These observations do not guarantee behavior for every account/message. '
+             'Full verification still reports line-ending changes as different bytes.')),
     dict(provider='Microsoft Outlook/Hotmail', hosts=('outlook.office365.com',),
          observed='2026-10-04',
-         behavior='Observed: trims address/date header whitespace; adds recipient angle brackets; '
-                  'quotes charset parameters; changes Message-ID field capitalization; '
-                  'reorders MIME-Version. RFC822.SIZE differed from the fetched literal.',
-         scope='One supplied source/Outlook message diff plus migration logs. '
-               'No guarantee for other messages/accounts. Exact byte preservation failed; '
-               'the shown header changes are eligible for equivalence checks.'),
+         behavior=(
+             'Header whitespace: trims address/date whitespace.',
+             'Header formatting: adds recipient angle brackets, quotes charset parameters, '
+             'changes Message-ID capitalization and reorders MIME-Version.',
+             'Reported size: RFC822.SIZE differed from the fetched literal.'),
+         scope=('One supplied source/Outlook message diff plus migration logs.',),
+         limits=('Exact byte preservation failed. The shown header changes are eligible '
+                 'for equivalence checks; behavior for other messages/accounts is not guaranteed.',)),
     dict(provider='GMX', hosts=('imap.gmx.com',), observed='2026-10-04',
          max_folder_levels=3,
-         behavior='Does not allow more than 3 total folder levels (top level plus two subfolder levels). '
-                  'The migration root counts as one level. A fourth-level CREATE was rejected.',
-         scope='Observed at imap.gmx.com; consistent with GMX folder documentation at '
-               'https://hilfe.gmx.net/premium/postfach/ordner-verwalten.html . '
-               'Message byte-preservation behavior has not been established.'),
+         behavior=(
+             'Folder nesting: at most 3 total levels (top level plus two subfolder levels). '
+             'The migration root counts as one level; a fourth-level CREATE was rejected.',),
+         scope=(
+             'Observed at imap.gmx.com; consistent with GMX folder documentation:',
+             'https://hilfe.gmx.net/premium/postfach/ordner-verwalten.html'),
+         limits=('Message byte-preservation behavior has not been established.',)),
 ]
 
 
 def show_provider_notes(server=None):
+    # Keep prose readable on narrow terminals and when redirected to a file.
+    width = max(24, min(88, shutil.get_terminal_size((88, 24)).columns)
+                - (14 if PROGRESS_ENABLED else 0))
+    def wrapped(text, indent='  '):
+        log(textwrap.fill(text, width=width, initial_indent=indent,
+            subsequent_indent=indent, break_long_words=False, break_on_hyphens=False))
+    def section(label, items, bullets=False):
+        log('  '+label+':')
+        for item in items:
+            if bullets:
+                log(textwrap.fill(item, width=width, initial_indent='    - ',
+                    subsequent_indent='      ', break_long_words=False,
+                    break_on_hyphens=False))
+            else:
+                wrapped(item, '    ')
+    def provider(note):
+        log(note['provider'])
+        wrapped('IMAP hosts: '+', '.join(note['hosts']))
+        wrapped('Observed: '+note['observed'])
+        log()
+        section('Observed behavior', note['behavior'], bullets=True)
+        log()
+        section('Evidence', note['scope'])
+        log()
+        section('Limits', note['limits'], bullets=True)
+        log()
     if server is None:
-        log('Provider | IMAP host | Observed | Behavior')
+        log('Provider observations\n')
         for note in PROVIDER_NOTES:
-            log(f"{note['provider']} | {', '.join(note['hosts'])} | {note['observed']} | {note['behavior']}")
-            log('  Evidence/scope: ' + note['scope'])
-        log('Unlisted providers: UNKNOWN; run a representative test and full verification.')
-        return
-    matches = [note for note in PROVIDER_NOTES if server.casefold() in note['hosts']]
-    log(f'\nDestination preservation notice: {server}')
-    if not matches:
-        log('  No recorded observations for this host. Preservation behavior is UNKNOWN.')
-        log('  Test representative mail and inspect full verification before deleting originals.')
-    for note in matches:
-        log('  ' + note['behavior'])
-        log('  Evidence/scope: ' + note['scope'])
-    log('  Provider notes never relax comparison rules or authorize duplicate matching.\n')
+            provider(note)
+        wrapped('Unlisted providers: UNKNOWN. Run a representative test and full verification.')
+    else:
+        matches = [note for note in PROVIDER_NOTES if server.casefold() in note['hosts']]
+        log(f'\nDestination preservation notice: {server}\n')
+        if not matches:
+            wrapped('No recorded observations for this host. Preservation behavior is UNKNOWN.')
+            wrapped('Test representative mail and inspect full verification before deleting originals.')
+            log()
+        for note in matches:
+            provider(note)
+    wrapped('Provider notes never relax comparison rules or authorize duplicate matching.')
+    log()
 
 
 def check_provider_layout(server, names, delimiter):
