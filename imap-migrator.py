@@ -80,6 +80,7 @@ RUN_STARTED = time.monotonic()
 OUTPUT_LOCK = threading.RLock()
 _progress_rows = 0
 _progress_columns = None
+LOG_FILE = None
 
 
 def elapsed_stamp():
@@ -90,17 +91,28 @@ def elapsed_stamp():
     return f'[{hours:02d}:{minutes:02d}:{seconds:02d}.{hundredths:02d}]'
 
 
-def log(*args, sep=' ', end='\n', file=None, flush=True):
-    global _progress_rows
+def log(*args, sep=' ', end='\n', file=None, flush=True, file_only=False):
+    global _progress_rows, LOG_FILE
     stream = sys.stdout if file is None else file
     text = sep.join(str(arg) for arg in args)
     with OUTPUT_LOCK:
         # A normal message freezes the last progress block, preventing subsequent
         # terminal redraws from erasing diagnostics (including worker messages).
-        _progress_rows = 0
+        if not file_only:
+            _progress_rows = 0
         stamp = elapsed_stamp()
         text = '\n'.join(stamp+' '+line if line else '' for line in text.split('\n'))
-        builtins.print(text, end=end, file=stream, flush=flush)
+        if not file_only:
+            builtins.print(text, end=end, file=stream, flush=flush)
+        if LOG_FILE is not None:
+            try:
+                builtins.print(text, end=end, file=LOG_FILE, flush=True)
+            except OSError as exc:
+                failed_log, LOG_FILE = LOG_FILE, None
+                with contextlib.suppress(OSError):
+                    failed_log.close()
+                builtins.print(stamp+' WARNING: log file write failed; file logging disabled: '+str(exc),
+                               file=sys.stderr, flush=True)
 
 
 def human_duration(seconds):
@@ -1096,6 +1108,17 @@ class Session:
             return uid
         return None
 
+    def fetch_headers(self, ids):
+        fields = '(UID FLAGS INTERNALDATE RFC822.SIZE BODY.PEEK[HEADER.FIELDS (SUBJECT DATE)])'
+        def run(c):
+            data = require_ok(c.uid('FETCH', ','.join(map(str, ids)), fields),
+                              f'{self.label}: diagnostic header FETCH')
+            records = fetch_records(data, bodies=False)
+            if any(uid not in records or 'raw' not in records[uid] for uid in ids):
+                raise RuntimeError(f'{self.label}: diagnostic headers omitted requested UID')
+            return {uid: records[uid]['raw'] for uid in ids}
+        return self.read('diagnostic header FETCH', run)
+
 
     def require_uid_expunge(self):
         if self.label != 'destination':
@@ -1589,6 +1612,7 @@ class Progress:
         self.folder_total = self.folder_done = self.folder_copied = self.folder_mapped = 0
         self.uploaded, self.downloaded = 0, 0
         self.start, self.last = time.monotonic(), 0
+        self.log_last = 0
 
     def begin_folder(self, total, mapped, destination_count):
         self.folder_total, self.folder_done = total, mapped
@@ -1620,6 +1644,9 @@ class Progress:
         elapsed = max(now-self.start, .001)
         lines = self.progress_lines(elapsed)
         with OUTPUT_LOCK:
+            if LOG_FILE is not None and (force or now-self.log_last >= 10):
+                log('\n'.join(lines), file_only=True)
+                self.log_last = now
             columns = shutil.get_terminal_size().columns
             if live and _progress_rows and columns == _progress_columns:
                 sys.stdout.write(f'\x1b[{_progress_rows}A\r\x1b[J')
@@ -1716,6 +1743,42 @@ def human_bytes(n):
         value /= 1024
 
 
+MESSAGE_DIAGNOSTIC_LIMIT = 5  # Per folder/phase; provider rewriting may affect every message.
+
+
+def message_header_bytes(raw):
+    # Retain bounded source headers for upload diagnostics, not whole bodies.
+    limit = min(len(raw), 64*1024)
+    ends = [raw.find(separator, 0, limit) for separator in (b'\r\n\r\n', b'\n\n', b'\r\r')]
+    end = min((pos for pos in ends if pos >= 0), default=limit)
+    return raw[:end], end == 64*1024
+
+
+def message_log_headers(raw):
+    try:
+        message = email.parser.BytesHeaderParser(policy=email.policy.default).parsebytes(raw)
+        # repr() at output prevents header control characters corrupting the terminal.
+        return [(name, str(value)) for name in ('Subject', 'Date')
+                for value in message.get_all(name, [])]
+    except Exception:
+        return None
+
+
+def show_message_identity(src, sf, sv, su, df, dv, du, reason, headers=None, file_only=False):
+    log(f'  {reason}: source folder={sf!r} UIDVALIDITY={sv} UID={su}; '
+        f'destination folder={df!r} UIDVALIDITY={dv} UID={du}', file_only=file_only)
+    if isinstance(src, ArchiveSource):
+        eml, _ = archive_message_paths(src.root, src.entries[sf], su)
+        log(f'    Archived EML: {str(eml.absolute())!r}', file_only=file_only)
+    if headers is None:
+        log('    Source Subject/Date unavailable.', file_only=file_only)
+    elif not headers:
+        log('    Source has no Subject or Date header.', file_only=file_only)
+    else:
+        for name, value in headers:
+            log(f'    Source {name}: {value!r}', file_only=file_only)
+
+
 def migrate_folder(src, dst, j, f, df, delim, opts, progress):
     ensure_folder(dst, df, delim)
     dv, dest = inventory(dst, j, 'destination', df, opts)
@@ -1771,8 +1834,10 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
     waiting_bytes = 0
     rewritten = 0
     diagnosed = False
+    diagnostic_count = 0
+    diagnostic_suppressed = False
     def check_uploaded():
-        nonlocal waiting_bytes, rewritten, diagnosed
+        nonlocal waiting_bytes, rewritten, diagnosed, diagnostic_count, diagnostic_suppressed
         if not waiting:
             return
         fetched = dst.fetch(list(waiting))
@@ -1785,6 +1850,19 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
             if expected['canon'] != got['canon']:
                 failures.append(du)
                 equivalent_count += equivalent(expected, got)
+                if diagnostic_count < MESSAGE_DIAGNOSTIC_LIMIT or LOG_FILE is not None:
+                    header_bytes, truncated = expected['log_header_bytes']
+                    show_message_identity(src, f.name, sv, expected['uid'], df, dv, du,
+                        'Accepted message changed bytes', message_log_headers(header_bytes),
+                        file_only=diagnostic_count >= MESSAGE_DIAGNOSTIC_LIMIT)
+                    if truncated:
+                        log('    Source header diagnostic limited to the first 64 KiB.',
+                            file_only=diagnostic_count >= MESSAGE_DIAGNOSTIC_LIMIT)
+                if diagnostic_count >= MESSAGE_DIAGNOSTIC_LIMIT and not diagnostic_suppressed:
+                    log(f'  Further changed-message details suppressed for {df!r} '
+                        f'(limit {MESSAGE_DIAGNOSTIC_LIMIT}); counts and journal mappings are retained.')
+                    diagnostic_suppressed = True
+                diagnostic_count += 1
                 if not diagnosed and summary is not None:
                     show_content_difference(summary, got['raw'])
                     diagnosed = True
@@ -1833,7 +1911,9 @@ def migrate_folder(src, dst, j, f, df, delim, opts, progress):
                 bound[uid] = du
                 summary = content_summary(rec['raw']) if not diagnosed else None
                 waiting[du] = ({key: rec[key] for key in
-                    ('canon', 'semantic', 'semantic_version')}, summary)
+                    ('uid', 'canon', 'semantic', 'semantic_version')}, summary)
+                if diagnostic_count < MESSAGE_DIAGNOSTIC_LIMIT or LOG_FILE is not None:
+                    waiting[du][0]['log_header_bytes'] = message_header_bytes(rec['raw'])
                 waiting_bytes += len(rec['raw'])
                 if len(waiting) >= opts.batch_messages or waiting_bytes >= opts.batch_bytes:
                     check_uploaded()
@@ -1877,6 +1957,35 @@ def verify_folder(src, dst, j, f, df, opts):
         missing,extra = sum((s-d).values()),sum((d-s).values())
         meta = sum((sm-dm).values()) + sum((dm-sm).values())
         changed = max(0, len(source)-strict-missing)
+    # Report every known mismatching pair, even when other bindings are missing.
+    # Never infer a pairing from a Message-ID or an unmatched content count.
+    different_pairs = {}
+    for su, du in sorted(mapped.items()):
+        differences = []
+        if source[su]['strict'] != dest[du]['strict']:
+            differences.append('bytes (checked-equivalent)' if equivalent(source[su], dest[du])
+                               else 'bytes (changed or uncertain)')
+        if source[su]['flags'] != dest[du]['flags']:
+            differences.append('flags')
+        if source[su]['epoch'] != dest[du]['epoch']:
+            differences.append('INTERNALDATE')
+        if differences:
+            different_pairs[su] = (du, differences)
+    # Cap terminal output; a requested log receives every differing pair.
+    # Fetch only headers, not another copy of every changed message body.
+    terminal_uids = set(sorted(different_pairs)[:MESSAGE_DIAGNOSTIC_LIMIT])
+    diagnostic_uids = sorted(different_pairs) if LOG_FILE is not None else sorted(terminal_uids)
+    for ids in batches(source, diagnostic_uids, opts.batch_messages, opts.batch_bytes):
+        diagnostics = src.fetch_headers(ids)
+        for su in ids:
+            du, differences = different_pairs[su]
+            show_message_identity(src, f.name, sv, su, df, dv, du,
+                'Verification difference: '+', '.join(differences),
+                message_log_headers(diagnostics[su]), file_only=su not in terminal_uids)
+    if len(different_pairs) > len(terminal_uids):
+        log(f'  {df!r}: terminal details shown for {len(terminal_uids)}/{len(different_pairs)} '
+            f'differing mapped messages; {len(different_pairs)-len(terminal_uids)} suppressed on terminal. '
+            'All differences are counted; all UID mappings remain in the journal.')
     # Detect changes throughout body scans, including concurrent deletions/arrivals.
     def stable(s, recs):
         snap = s.snapshot()
@@ -2508,6 +2617,15 @@ class ArchiveSource:
         self.last_activity = time.monotonic()
         return result
 
+    def fetch_headers(self, ids):
+        headers = {}
+        for uid in ids:
+            check_stop()
+            eml, _ = archive_message_paths(self.root, self.entries[self.mailbox], uid)
+            with eml.open('rb') as stream:
+                headers[uid] = stream.read(64*1024)
+        return headers
+
     def read(self, operation, func):
         check_stop()
         return func(self)
@@ -2521,7 +2639,7 @@ class ArchiveSource:
 
 
 def main(argv=None):
-    global CONFIG_PATH, _stop_requested, RUN_STARTED, _progress_rows
+    global CONFIG_PATH, _stop_requested, RUN_STARTED, _progress_rows, LOG_FILE
     RUN_STARTED = time.monotonic()
     _progress_rows = 0
     parser = argparse.ArgumentParser(description=__doc__,
@@ -2538,6 +2656,8 @@ def main(argv=None):
     parser.add_argument('--path', type=Path, help='Archive directory, required with --export/--import')
     parser.add_argument('--provider-notes', action='store_true', help='Show observed provider preservation behavior and exit')
     parser.add_argument('--config', type=Path, help='INI path (default: beside script)')
+    parser.add_argument('--log-file', type=Path,
+        help='Append timestamped status, periodic progress and all changed-message identities/Subjects/Dates to this UTF-8 file')
     parser.add_argument('--skip-destination-tree-deploy', action='store_true',
         help='Skip upfront folder creation, writable-selection checks and subscriptions; folders are still checked/created as reached during copying or repair')
     parser.add_argument('--full-verify', action='store_true', help='Re-download both sides for independent content verification')
@@ -2574,6 +2694,14 @@ def main(argv=None):
         source_cfg, dest_cfg, root = load_config('export' if args.export_archive else
                                                   'import' if args.import_archive else 'migration')
         opts = options(args)
+        if args.log_file:
+            log_path = args.log_file.expanduser().absolute()
+            if log_path.resolve() in (ini_path().resolve(), opts.journal.resolve()):
+                raise RuntimeError('Log file must differ from configuration and journal')
+            descriptor = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            LOG_FILE = os.fdopen(descriptor, 'a', encoding='utf-8')
+            log('\nRun started at '+_dt.datetime.now(_dt.timezone.utc).isoformat())
+            log(f'Log file: {str(log_path)!r}; includes message Subjects and Dates.')
         if args.export_archive or args.import_archive:
             archive_root = args.path.expanduser().resolve()
             if args.import_archive and not archive_root.is_dir():
@@ -2680,6 +2808,10 @@ def main(argv=None):
         for item in (src,dst,journal,archive_lock):
             if item:
                 item.close()
+        if LOG_FILE is not None:
+            with contextlib.suppress(OSError):
+                LOG_FILE.close()
+            LOG_FILE = None
         os.umask(previous_umask)
 
 
